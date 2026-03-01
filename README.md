@@ -10,6 +10,27 @@ python -m pip install -r requirements.txt
 
 > If your editor still shows `Import "numpy" could not be resolved` or `Import "pandas" could not be resolved`, select the same Python interpreter/venv where you installed the requirements.
 
+## Troubleshooting: missing `requirements.txt`
+
+If you cannot find the dependency file, verify you are in the repository root:
+
+```bash
+pwd
+ls
+```
+
+You should see:
+
+- `requirements.txt`
+- `space_programming_pipeline.py`
+- `README.md`
+
+Then install with:
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 ## What is included
 
 - `ProjectConfig` dictionary-driven ingestion (file path, sheet, header row, column mapping).
