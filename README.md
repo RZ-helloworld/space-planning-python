@@ -45,7 +45,10 @@ python -m pip install -r requirements.txt
 ## Quick start
 
 ```python
-from space_programming_pipeline import run_space_programming_pipeline
+from space_programming_pipeline import (
+    run_space_programming_pipeline,
+    run_space_programming_pipeline_staged,
+)
 
 PROJECT_CONFIG = {
     "file_path": "./data/space_program.xlsx",
@@ -66,6 +69,13 @@ PROJECT_CONFIG = {
 }
 
 df_clean, df_final, discrepancy_outliers = run_space_programming_pipeline(PROJECT_CONFIG)
+
+# staged execution (for debugging / QA)
+stages = run_space_programming_pipeline_staged(PROJECT_CONFIG)
+print(stages["df_raw"].shape)
+print(stages["df_clean"].shape)
+print(stages["df_final"].head())
+print(stages["discrepancy_outliers"].head())
 ```
 
 `df_final` is prepared for adjacency analysis and BI/export workflows.

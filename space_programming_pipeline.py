@@ -9,6 +9,7 @@ import pandas as pd
 logger = logging.getLogger(__name__)
 
 ProjectConfig = Dict[str, Any]
+PipelineStages = Dict[str, pd.DataFrame]
 
 
 def _strip_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
@@ -199,10 +200,50 @@ def run_space_programming_pipeline(
       - df_final: floor summary table for downstream tools
       - discrepancy_outliers: audit table where discrepancy > 1 sqft
     """
-    df_clean = load_and_clean_data(config)
+    stages = run_space_programming_pipeline_staged(config)
+    df_clean = stages["df_clean"]
+    df_final = stages["df_final"]
+    discrepancy_outliers = stages["discrepancy_outliers"]
+    return df_clean, df_final, discrepancy_outliers
+
+
+def run_space_programming_pipeline_staged(config: ProjectConfig) -> PipelineStages:
+    """
+    Run pipeline in explicit stages and return each stage result.
+
+    Useful for debugging and step-by-step QA in notebooks or scripts.
+    """
+    df_raw = pd.read_excel(
+        config["file_path"],
+        sheet_name=config.get("sheet_name", "roompct"),
+        header=config.get("header", 2),
+        dtype=_build_dtype_map(config),
+    )
+    df_clean = _strip_dataframe_strings(df_raw)
+
+    room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
+    if room_code_col in df_clean.columns:
+        df_clean[room_code_col] = df_clean[room_code_col].map(_normalize_room_code)
+    else:
+        logger.warning("Missing room code column '%s'.", room_code_col)
+
+    numeric_logical_cols = config.get("numeric_cols", [])
+    numeric_cols = [_get_column_name(config, name) for name in numeric_logical_cols]
+    for col in numeric_cols:
+        if col in df_clean.columns:
+            df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
+        else:
+            logger.warning("Missing numeric column '%s'; coercion skipped.", col)
+
     df_final = generate_floor_summaries(df_clean, config)
     discrepancy_outliers = detect_discrepancy_outliers(df_clean, config)
-    return df_clean, df_final, discrepancy_outliers
+
+    return {
+        "df_raw": df_raw,
+        "df_clean": df_clean,
+        "df_final": df_final,
+        "discrepancy_outliers": discrepancy_outliers,
+    }
 
 
 if __name__ == "__main__":
