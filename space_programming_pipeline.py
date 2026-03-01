@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,6 +33,22 @@ def _existing_columns(df: pd.DataFrame, column_names: Iterable[str]) -> List[str
     return [col for col in column_names if col in df.columns]
 
 
+def _build_dtype_map(config: ProjectConfig) -> Mapping[str, str]:
+    """Build pandas dtype map for critical fields that must not lose formatting."""
+    room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
+    return {room_code_col: "string"}
+
+
+def _normalize_room_code(value: Any) -> Any:
+    """Normalize room-code values while preserving explicit strings and nulls."""
+    if pd.isna(value):
+        return np.nan
+    if isinstance(value, str):
+        cleaned = value.strip()
+        return cleaned if cleaned else np.nan
+    return str(value).strip()
+
+
 def load_and_clean_data(config: ProjectConfig) -> pd.DataFrame:
     """
     Load Excel data using config, then normalize/clean with decay-tolerant behavior.
@@ -49,15 +65,13 @@ def load_and_clean_data(config: ProjectConfig) -> pd.DataFrame:
         config["file_path"],
         sheet_name=config.get("sheet_name", "roompct"),
         header=config.get("header", 2),
+        dtype=_build_dtype_map(config),
     )
     df = _strip_dataframe_strings(df)
 
-    # Ensure Room Code is preserved as string for leading-zero safety.
     room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
     if room_code_col in df.columns:
-        df[room_code_col] = df[room_code_col].map(
-            lambda v: str(v).strip() if pd.notna(v) else np.nan
-        )
+        df[room_code_col] = df[room_code_col].map(_normalize_room_code)
     else:
         logger.warning("Missing room code column '%s'.", room_code_col)
 
@@ -91,9 +105,9 @@ def generate_floor_summaries(df: pd.DataFrame, config: ProjectConfig) -> pd.Data
         working = df.copy()
         working["building_floor_key"] = (
             working[existing_id_components]
+            .fillna("UNKNOWN")
             .astype(str)
-            .apply(lambda row: "-".join(row.values), axis=1)
-            .str.replace("nan", "UNKNOWN", regex=False)
+            .apply(lambda row: "-".join([v.strip() for v in row.values]), axis=1)
         )
 
     truth_area_col = _get_column_name(config, config.get("truth_area_col", "calculated_area"))
@@ -118,14 +132,13 @@ def generate_floor_summaries(df: pd.DataFrame, config: ProjectConfig) -> pd.Data
             .sort_values("building_floor_key")
         )
 
-    grouped = (
+    return (
         working.groupby("building_floor_key", dropna=False)
         .agg(**agg_spec)
         .reset_index()
         .sort_values("building_floor_key")
         .reset_index(drop=True)
     )
-    return grouped
 
 
 def detect_discrepancy_outliers(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
@@ -155,20 +168,14 @@ def detect_discrepancy_outliers(df: pd.DataFrame, config: ProjectConfig) -> pd.D
         )
 
     audit = df[[truth_area_col, room_area_col, pct_col]].copy()
-    pct = audit[pct_col].astype(float)
+    pct = pd.to_numeric(audit[pct_col], errors="coerce")
     normalized_pct = np.where(np.abs(pct) > 1, pct / 100.0, pct)
-    audit["expected_area"] = audit[room_area_col] * normalized_pct
-    audit["discrepancy_sqft"] = audit[truth_area_col] - audit["expected_area"]
+    audit["expected_area"] = pd.to_numeric(audit[room_area_col], errors="coerce") * normalized_pct
+    audit["discrepancy_sqft"] = pd.to_numeric(audit[truth_area_col], errors="coerce") - audit["expected_area"]
     audit["discrepancy_abs_sqft"] = audit["discrepancy_sqft"].abs()
 
     outliers = audit[audit["discrepancy_abs_sqft"] > 1.0].copy()
-    outliers = outliers.reset_index().rename(columns={"index": "row_index"})
-
-    outliers = outliers.rename(
-        columns={
-            truth_area_col: "calculated_area",
-        }
-    )
+    outliers = outliers.reset_index().rename(columns={"index": "row_index", truth_area_col: "calculated_area"})
 
     return outliers[
         [
@@ -181,7 +188,9 @@ def detect_discrepancy_outliers(df: pd.DataFrame, config: ProjectConfig) -> pd.D
     ]
 
 
-def run_space_programming_pipeline(config: ProjectConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+def run_space_programming_pipeline(
+    config: ProjectConfig,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     End-to-end pipeline orchestration.
 
@@ -199,7 +208,6 @@ def run_space_programming_pipeline(config: ProjectConfig) -> Tuple[pd.DataFrame,
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
 
-    # Example config for a portable, framework-wall style mapping.
     PROJECT_CONFIG: ProjectConfig = {
         "file_path": "./data/space_program.xlsx",
         "sheet_name": "roompct",

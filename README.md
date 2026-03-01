@@ -2,6 +2,14 @@
 
 Modular Python pipeline for architectural space programming with a **framework-wall** architecture (logic decoupled from institution-specific Excel schemas).
 
+## Install dependencies
+
+```bash
+python -m pip install -r requirements.txt
+```
+
+> If your editor still shows `Import "numpy" could not be resolved` or `Import "pandas" could not be resolved`, select the same Python interpreter/venv where you installed the requirements.
+
 ## What is included
 
 - `ProjectConfig` dictionary-driven ingestion (file path, sheet, header row, column mapping).
