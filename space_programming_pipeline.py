@@ -34,6 +34,20 @@ def _existing_columns(df: pd.DataFrame, column_names: Iterable[str]) -> List[str
     return [col for col in column_names if col in df.columns]
 
 
+def _resolve_configured_column_names(config: ProjectConfig, configured_cols: Iterable[str]) -> List[str]:
+    """Accept either logical names or physical Excel column names in config lists."""
+    columns_map = config.get("columns", {})
+    physical_values = set(columns_map.values())
+
+    resolved: List[str] = []
+    for col in configured_cols:
+        if col in physical_values:
+            resolved.append(col)
+        else:
+            resolved.append(_get_column_name(config, col))
+    return resolved
+
+
 def _build_dtype_map(config: ProjectConfig) -> Mapping[str, str]:
     """Build pandas dtype map for critical fields that must not lose formatting."""
     room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
@@ -76,8 +90,8 @@ def load_and_clean_data(config: ProjectConfig) -> pd.DataFrame:
     else:
         logger.warning("Missing room code column '%s'.", room_code_col)
 
-    numeric_logical_cols = config.get("numeric_cols", [])
-    numeric_cols = [_get_column_name(config, name) for name in numeric_logical_cols]
+    numeric_config_cols = config.get("numeric_cols", [])
+    numeric_cols = _resolve_configured_column_names(config, numeric_config_cols)
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -227,8 +241,8 @@ def run_space_programming_pipeline_staged(config: ProjectConfig) -> PipelineStag
     else:
         logger.warning("Missing room code column '%s'.", room_code_col)
 
-    numeric_logical_cols = config.get("numeric_cols", [])
-    numeric_cols = [_get_column_name(config, name) for name in numeric_logical_cols]
+    numeric_config_cols = config.get("numeric_cols", [])
+    numeric_cols = _resolve_configured_column_names(config, numeric_config_cols)
     for col in numeric_cols:
         if col in df_clean.columns:
             df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
@@ -244,6 +258,15 @@ def run_space_programming_pipeline_staged(config: ProjectConfig) -> PipelineStag
         "df_final": df_final,
         "discrepancy_outliers": discrepancy_outliers,
     }
+
+
+def run_pitt_pipeline(config: ProjectConfig, export_path: str = "Floor_Summary_Result.xlsx") -> PipelineStages:
+    """Convenience wrapper for UPitt-style execution and export."""
+    logger.info("🚀 Start loading UPitt space data...")
+    stages = run_space_programming_pipeline_staged(config)
+    stages["df_final"].to_excel(export_path, index=False)
+    logger.info("💾 Floor summary exported to: %s", export_path)
+    return stages
 
 
 if __name__ == "__main__":

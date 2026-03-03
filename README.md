@@ -31,6 +31,41 @@ Then install with:
 python -m pip install -r requirements.txt
 ```
 
+
+## UPitt phased run (你的配置可直接用)
+
+```python
+import logging
+from space_programming_pipeline import run_pitt_pipeline
+
+PITT_CONFIG = {
+    "file_path": "20251101 UPitt Space List - In Scope.xlsx",
+    "sheet_name": "Rooms Pct",
+    "header": 2,
+    "columns": {
+        "building": "Building Code",
+        "floor": "Floor Code",
+        "room_code": "Room Code",
+        "room_area": "Room Area",
+        "percentage": "Percentage of Space",
+        "calculated_area": "Calculated Area",
+    },
+    "id_components": ["building", "floor"],
+    # 支持 logical names 或 physical Excel names 两种写法
+    "numeric_cols": ["Room Area", "Percentage of Space", "Calculated Area"],
+    "truth_area_col": "calculated_area",
+    "room_code_col": "room_code",
+}
+
+logging.basicConfig(level=logging.INFO)
+stages = run_pitt_pipeline(PITT_CONFIG, export_path="Floor_Summary_Result.xlsx")
+
+print(stages["df_raw"].shape)
+print(stages["df_clean"].shape)
+print(stages["df_final"].head())
+print(stages["discrepancy_outliers"].head())
+```
+
 ## What is included
 
 - `ProjectConfig` dictionary-driven ingestion (file path, sheet, header row, column mapping).
