@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import glob
 import logging
+import sqlite3
+from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Tuple
 
 import numpy as np
@@ -10,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 ProjectConfig = Dict[str, Any]
 PipelineStages = Dict[str, pd.DataFrame]
+DEFAULT_EXPECTED_FILE = "20251101 UPitt Space List - In Scope.xlsx"
 
 
 def _strip_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
@@ -64,24 +68,137 @@ def _normalize_room_code(value: Any) -> Any:
     return str(value).strip()
 
 
+def _resolve_file_path(source: ProjectConfig) -> str:
+    """Resolve explicit file path or glob patterns with clear multi-file guidance."""
+    file_path = source.get("file_path")
+    if file_path:
+        return str(file_path)
+
+    file_glob = source.get("file_glob")
+    if not file_glob:
+        raise ValueError("Missing 'file_path' (or optional 'file_glob') in source config.")
+
+    matched = sorted(glob.glob(file_glob))
+    if len(matched) == 1:
+        return matched[0]
+    if len(matched) == 0:
+        expected = source.get("expected_file_name", DEFAULT_EXPECTED_FILE)
+        raise FileNotFoundError(
+            f"找不到文件！请确认 '{expected}' 是否已放在目录下。\n"
+            f"提示：当前 file_glob='{file_glob}' 未匹配到任何文件。"
+        )
+
+    raise ValueError(
+        "检测到多个文件来源，请改用 config['sources'] 逐个声明，或把 file_path 设置为唯一文件。\n"
+        f"当前 file_glob='{file_glob}' 匹配到: {matched}"
+    )
+
+
+def _guard_file_exists(file_path: str, expected_file_name: str | None = None) -> None:
+    """Gatekeeper for friendly file-not-found diagnostics."""
+    path = Path(file_path)
+    if path.exists():
+        return
+
+    expected = expected_file_name or DEFAULT_EXPECTED_FILE
+    raise FileNotFoundError(
+        f"找不到文件！请确认 '{expected}' 是否已放在目录下。\n"
+        f"当前路径: {file_path}\n"
+        "如果文件名不同：请在 config['file_path'] 或 source['file_path'] 中改成真实文件名。\n"
+        "如果有多个来源：请使用 config['sources']=[...]。\n"
+        "如果来源是数据库：请使用 source={'source_type':'database', ...}。"
+    )
+
+
+def _load_source_data(source: ProjectConfig, root_config: ProjectConfig) -> pd.DataFrame:
+    """Load one source: excel/csv/database/dataframe."""
+    source_type = source.get("source_type", "excel").lower()
+
+    if source_type == "excel":
+        file_path = _resolve_file_path(source)
+        _guard_file_exists(file_path, source.get("expected_file_name", DEFAULT_EXPECTED_FILE))
+        return pd.read_excel(
+            file_path,
+            sheet_name=source.get("sheet_name", root_config.get("sheet_name", "roompct")),
+            header=source.get("header", root_config.get("header", 2)),
+            dtype=_build_dtype_map(root_config),
+        )
+
+    if source_type == "csv":
+        file_path = _resolve_file_path(source)
+        _guard_file_exists(file_path, source.get("expected_file_name", DEFAULT_EXPECTED_FILE))
+        return pd.read_csv(file_path, dtype=_build_dtype_map(root_config))
+
+    if source_type == "database":
+        query = source.get("query")
+        if not query:
+            raise ValueError("Database source requires 'query'.")
+
+        sqlite_path = source.get("sqlite_path")
+        if sqlite_path:
+            _guard_file_exists(sqlite_path, source.get("expected_file_name", sqlite_path))
+            with sqlite3.connect(sqlite_path) as conn:
+                return pd.read_sql_query(query, conn)
+
+        connection = source.get("connection")
+        if connection is not None:
+            return pd.read_sql_query(query, connection)
+
+        connection_uri = source.get("connection_uri")
+        if connection_uri is not None:
+            return pd.read_sql(query, connection_uri)
+
+        raise ValueError(
+            "Database source requires one of: 'sqlite_path', 'connection', or 'connection_uri'."
+        )
+
+    if source_type == "dataframe":
+        df = source.get("dataframe")
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("dataframe source requires a pandas DataFrame in source['dataframe']")
+        return df.copy()
+
+    raise ValueError(f"Unsupported source_type: '{source_type}'")
+
+
+def _load_raw_data(config: ProjectConfig) -> pd.DataFrame:
+    """Load raw data from one or multiple sources."""
+    if config.get("sources"):
+        sources = config["sources"]
+        frames: List[pd.DataFrame] = []
+        for idx, source in enumerate(sources):
+            loaded = _load_source_data(source, config)
+            loaded = loaded.copy()
+            loaded["__source_name"] = source.get("source_name", f"source_{idx + 1}")
+            frames.append(loaded)
+
+        return pd.concat(frames, ignore_index=True, sort=False)
+
+    # backward-compatible single-source config
+    single_source = {
+        "source_type": config.get("source_type", "excel"),
+        "file_path": config.get("file_path"),
+        "file_glob": config.get("file_glob"),
+        "sheet_name": config.get("sheet_name", "roompct"),
+        "header": config.get("header", 2),
+        "query": config.get("query"),
+        "sqlite_path": config.get("sqlite_path"),
+        "connection": config.get("connection"),
+        "connection_uri": config.get("connection_uri"),
+        "expected_file_name": config.get("expected_file_name", DEFAULT_EXPECTED_FILE),
+    }
+    return _load_source_data(single_source, config)
+
+
 def load_and_clean_data(config: ProjectConfig) -> pd.DataFrame:
     """
-    Load Excel data using config, then normalize/clean with decay-tolerant behavior.
+    Load source data using config, then normalize/clean with decay-tolerant behavior.
 
-    Required config keys:
-      - file_path
-      - sheet_name
-      - header
-      - columns: logical_name -> physical_excel_column
-      - numeric_cols: list of logical names to coerce to numeric
-      - room_code_col: logical name for the room code field
+    Supports:
+      - single source (legacy): file_path/sheet_name/header
+      - multi-source: config['sources'] with source_type excel/csv/database/dataframe
     """
-    df = pd.read_excel(
-        config["file_path"],
-        sheet_name=config.get("sheet_name", "roompct"),
-        header=config.get("header", 2),
-        dtype=_build_dtype_map(config),
-    )
+    df = _load_raw_data(config)
     df = _strip_dataframe_strings(df)
 
     room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
@@ -102,13 +219,7 @@ def load_and_clean_data(config: ProjectConfig) -> pd.DataFrame:
 
 
 def generate_floor_summaries(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
-    """
-    Build floor-level summaries from a decoupled building-floor composite key.
-
-    Aggregation rules:
-      - truth_area_col: sum
-      - room_code_col: nunique (distinct physical room count)
-    """
+    """Build floor-level summaries from a decoupled building-floor composite key."""
     id_components = [_get_column_name(config, c) for c in config.get("id_components", [])]
     existing_id_components = _existing_columns(df, id_components)
 
@@ -157,11 +268,7 @@ def generate_floor_summaries(df: pd.DataFrame, config: ProjectConfig) -> pd.Data
 
 
 def detect_discrepancy_outliers(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
-    """
-    Compare Calculated Area vs (Room Area * Percentage) and return outliers > 1 sqft.
-
-    Supports percentage values stored as decimal fractions (0.25) or percentages (25).
-    """
+    """Compare Calculated Area vs (Room Area * Percentage) and return outliers > 1 sqft."""
     truth_area_col = _get_column_name(config, config.get("truth_area_col", "calculated_area"))
     room_area_col = _get_column_name(config, "room_area")
     pct_col = _get_column_name(config, "percentage")
@@ -203,52 +310,16 @@ def detect_discrepancy_outliers(df: pd.DataFrame, config: ProjectConfig) -> pd.D
     ]
 
 
-def run_space_programming_pipeline(
-    config: ProjectConfig,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    End-to-end pipeline orchestration.
-
-    Returns:
-      - df_clean: cleaned row-level data
-      - df_final: floor summary table for downstream tools
-      - discrepancy_outliers: audit table where discrepancy > 1 sqft
-    """
+def run_space_programming_pipeline(config: ProjectConfig) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """End-to-end pipeline orchestration."""
     stages = run_space_programming_pipeline_staged(config)
-    df_clean = stages["df_clean"]
-    df_final = stages["df_final"]
-    discrepancy_outliers = stages["discrepancy_outliers"]
-    return df_clean, df_final, discrepancy_outliers
+    return stages["df_clean"], stages["df_final"], stages["discrepancy_outliers"]
 
 
 def run_space_programming_pipeline_staged(config: ProjectConfig) -> PipelineStages:
-    """
-    Run pipeline in explicit stages and return each stage result.
-
-    Useful for debugging and step-by-step QA in notebooks or scripts.
-    """
-    df_raw = pd.read_excel(
-        config["file_path"],
-        sheet_name=config.get("sheet_name", "roompct"),
-        header=config.get("header", 2),
-        dtype=_build_dtype_map(config),
-    )
-    df_clean = _strip_dataframe_strings(df_raw)
-
-    room_code_col = _get_column_name(config, config.get("room_code_col", "room_code"))
-    if room_code_col in df_clean.columns:
-        df_clean[room_code_col] = df_clean[room_code_col].map(_normalize_room_code)
-    else:
-        logger.warning("Missing room code column '%s'.", room_code_col)
-
-    numeric_config_cols = config.get("numeric_cols", [])
-    numeric_cols = _resolve_configured_column_names(config, numeric_config_cols)
-    for col in numeric_cols:
-        if col in df_clean.columns:
-            df_clean[col] = pd.to_numeric(df_clean[col], errors="coerce")
-        else:
-            logger.warning("Missing numeric column '%s'; coercion skipped.", col)
-
+    """Run pipeline in explicit stages and return each stage result."""
+    df_raw = _load_raw_data(config)
+    df_clean = load_and_clean_data(config)
     df_final = generate_floor_summaries(df_clean, config)
     discrepancy_outliers = detect_discrepancy_outliers(df_clean, config)
 
@@ -271,23 +342,4 @@ def run_pitt_pipeline(config: ProjectConfig, export_path: str = "Floor_Summary_R
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-
-    PROJECT_CONFIG: ProjectConfig = {
-        "file_path": "./data/space_program.xlsx",
-        "sheet_name": "roompct",
-        "header": 2,
-        "columns": {
-            "building": "Building",
-            "floor": "Floor",
-            "room_code": "Room Code",
-            "room_area": "Room Area",
-            "percentage": "Percentage",
-            "calculated_area": "Calculated Area",
-        },
-        "id_components": ["building", "floor"],
-        "numeric_cols": ["room_area", "percentage", "calculated_area"],
-        "truth_area_col": "calculated_area",
-        "room_code_col": "room_code",
-    }
-
-    logger.info("Pipeline module ready. Call run_space_programming_pipeline(PROJECT_CONFIG).")
+    logger.info("Pipeline module ready. Import and call run_space_programming_pipeline(...).")

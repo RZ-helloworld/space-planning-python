@@ -8,34 +8,20 @@ Modular Python pipeline for architectural space programming with a **framework-w
 python -m pip install -r requirements.txt
 ```
 
-> If your editor still shows `Import "numpy" could not be resolved` or `Import "pandas" could not be resolved`, select the same Python interpreter/venv where you installed the requirements.
+## 门卫逻辑（文件缺失友好提示）
 
-## Troubleshooting: missing `requirements.txt`
+如果源文件不存在，代码会抛出友好提示：
 
-If you cannot find the dependency file, verify you are in the repository root:
+> 找不到文件！请确认 '20251101 UPitt Space List - In Scope.xlsx' 是否已放在目录下。
 
-```bash
-pwd
-ls
-```
+并附带下一步建议：
+- 文件名不同：修改 `file_path`
+- 多个文件来源：使用 `sources=[...]`
+- 数据库来源：使用 `source_type='database'`
 
-You should see:
-
-- `requirements.txt`
-- `space_programming_pipeline.py`
-- `README.md`
-
-Then install with:
-
-```bash
-python -m pip install -r requirements.txt
-```
-
-
-## UPitt phased run (你的配置可直接用)
+## 单文件（UPitt）示例
 
 ```python
-import logging
 from space_programming_pipeline import run_pitt_pipeline
 
 PITT_CONFIG = {
@@ -51,66 +37,60 @@ PITT_CONFIG = {
         "calculated_area": "Calculated Area",
     },
     "id_components": ["building", "floor"],
-    # 支持 logical names 或 physical Excel names 两种写法
+    # 支持 logical names 或 Excel 实际列名
     "numeric_cols": ["Room Area", "Percentage of Space", "Calculated Area"],
     "truth_area_col": "calculated_area",
     "room_code_col": "room_code",
 }
 
-logging.basicConfig(level=logging.INFO)
 stages = run_pitt_pipeline(PITT_CONFIG, export_path="Floor_Summary_Result.xlsx")
-
-print(stages["df_raw"].shape)
-print(stages["df_clean"].shape)
-print(stages["df_final"].head())
-print(stages["discrepancy_outliers"].head())
 ```
 
-## What is included
-
-- `ProjectConfig` dictionary-driven ingestion (file path, sheet, header row, column mapping).
-- `load_and_clean_data(config)` for whitespace cleanup, robust numeric coercion, and decay-tolerant missing-column warnings.
-- `generate_floor_summaries(df, config)` for bottom-up aggregation by composite Building-Floor key.
-- `detect_discrepancy_outliers(df, config)` to audit `Calculated Area` against `Room Area * Percentage`.
-- `run_space_programming_pipeline(config)` orchestration returning:
-  - `df_clean`
-  - `df_final`
-  - `discrepancy_outliers`
-
-## Quick start
+## 多源配置（多个文件 + 数据库）
 
 ```python
-from space_programming_pipeline import (
-    run_space_programming_pipeline,
-    run_space_programming_pipeline_staged,
-)
+from space_programming_pipeline import run_space_programming_pipeline_staged
 
-PROJECT_CONFIG = {
-    "file_path": "./data/space_program.xlsx",
-    "sheet_name": "roompct",
-    "header": 2,
+config = {
     "columns": {
-        "building": "Building",
-        "floor": "Floor",
+        "building": "Building Code",
+        "floor": "Floor Code",
         "room_code": "Room Code",
         "room_area": "Room Area",
-        "percentage": "Percentage",
+        "percentage": "Percentage of Space",
         "calculated_area": "Calculated Area",
     },
     "id_components": ["building", "floor"],
-    "numeric_cols": ["room_area", "percentage", "calculated_area"],
+    "numeric_cols": ["Room Area", "Percentage of Space", "Calculated Area"],
     "truth_area_col": "calculated_area",
     "room_code_col": "room_code",
+    "sources": [
+        {
+            "source_name": "upitt_excel",
+            "source_type": "excel",
+            "file_path": "20251101 UPitt Space List - In Scope.xlsx",
+            "sheet_name": "Rooms Pct",
+            "header": 2,
+        },
+        {
+            "source_name": "facility_db",
+            "source_type": "database",
+            "sqlite_path": "facility.db",
+            "query": "SELECT * FROM roompct_view",
+        },
+    ],
 }
 
-df_clean, df_final, discrepancy_outliers = run_space_programming_pipeline(PROJECT_CONFIG)
-
-# staged execution (for debugging / QA)
-stages = run_space_programming_pipeline_staged(PROJECT_CONFIG)
-print(stages["df_raw"].shape)
-print(stages["df_clean"].shape)
+stages = run_space_programming_pipeline_staged(config)
+print(stages["df_raw"].head())
 print(stages["df_final"].head())
-print(stages["discrepancy_outliers"].head())
 ```
 
-`df_final` is prepared for adjacency analysis and BI/export workflows.
+> 多源模式会自动添加 `__source_name` 字段用于追踪数据来源。
+
+## Core outputs
+
+- `df_clean`: cleaned row-level data
+- `df_final`: floor summary table
+- `discrepancy_outliers`: rows with discrepancy > 1 sqft
+
