@@ -322,13 +322,33 @@ def main() -> None:
     bldg_options = sorted([b for b in working_df["building"].dropna().unique().tolist() if str(b) != "<NA>"])
 
     with st.sidebar:
-        selected_depts = st.multiselect("Department Filter", options=dept_options, default=dept_options)
-        selected_bldgs = st.multiselect("Building Filter", options=bldg_options, default=bldg_options)
+        st.subheader("Filter Mode")
+        dept_filter_mode = st.selectbox(
+            "Department Filter Mode",
+            options=["All Departments", "Select Departments"],
+            index=0,
+        )
+        selected_depts = (
+            dept_options
+            if dept_filter_mode == "All Departments"
+            else st.multiselect("Department Filter (Multi-select)", options=dept_options, default=dept_options)
+        )
+
+        bldg_filter_mode = st.selectbox(
+            "Building Filter Mode",
+            options=["All Buildings", "Select Buildings"],
+            index=0,
+        )
+        selected_bldgs = (
+            bldg_options
+            if bldg_filter_mode == "All Buildings"
+            else st.multiselect("Building Filter (Multi-select)", options=bldg_options, default=bldg_options)
+        )
 
     scoped = working_df.copy()
-    if selected_depts:
+    if dept_filter_mode == "Select Departments":
         scoped = scoped[scoped["department"].isin(selected_depts)]
-    if selected_bldgs:
+    if bldg_filter_mode == "Select Buildings":
         scoped = scoped[scoped["building"].isin(selected_bldgs)]
 
     with st.expander("Step 3 · Run Recommendation Engine", expanded=True):

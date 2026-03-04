@@ -26,7 +26,7 @@ streamlit run app.py
 - **Strategy Sandbox (Sidebar)**
   - Area Threshold slider (`150–500 sqft`)
   - Target Density slider (`80–200 sqft/person`)
-  - Department + Building multiselect filters
+  - Department + Building filters now use dropdown mode (`All` / `Select`) + multi-select
 - **Recommendation Engine**
   - `Subdivide`: Office and area > threshold
   - `Reallocate`: occupancy == 0 or net area < 50
