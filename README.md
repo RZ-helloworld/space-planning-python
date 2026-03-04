@@ -24,13 +24,13 @@ streamlit run app.py
   - Optional manual header-row override switch when auto-detection is wrong
   - Mapping defaults hide `Unnamed:*` columns (toggle available to show advanced columns)
 - **Strategy Sandbox (Sidebar)**
-  - Area Threshold slider (`150–500 sqft`)
   - Target Density slider (`80–200 sqft/person`)
   - Department + Building filters now use dropdown mode (`All` / `Select`) + multi-select
-- **Recommendation Engine**
-  - `Subdivide`: Office and area > threshold
-  - `Reallocate`: occupancy == 0 or net area < 50
-  - Potential gain: `max(Current Area - Target Density, 0)`
+- **Rating Engine (Current Phase)**
+  - **Integrity Score**: `Critical` when `|Calculated Area - Room Area| > 25 sqft` (if Room Area is mapped)
+  - **Opportunity Score**: based on `Calculated Area - room-type average`
+  - Actionable in this phase: rows marked `Critical` integrity or `High` opportunity
+  - Reallocate logic is intentionally disabled in this phase
 - **Staged Confirmation Flow**
   - Step 1: Confirm header alignment before anything else
   - Step 2: Confirm required-field mapping and data readiness

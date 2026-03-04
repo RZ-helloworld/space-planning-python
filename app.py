@@ -19,16 +19,14 @@ REQUIRED_FIELDS: Dict[str, str] = {
 OPTIONAL_FIELDS: Dict[str, str] = {
     "department": "Department",
     "building": "Building",
-    "occupancy": "Occupancy",
-    "net_area": "Net Area",
+    "room_area": "Room Area",
 }
 
 TASK_PAGE_SIZE = 20
+INTEGRITY_GAP_THRESHOLD = 25.0
+OPPORTUNITY_HIGH_THRESHOLD = 50.0
 
 
-# ------------------------------
-# Ingest + preprocessing
-# ------------------------------
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.copy()
     cleaned.columns = [str(col).strip() for col in cleaned.columns]
@@ -37,7 +35,7 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     for col in object_cols:
         cleaned[col] = cleaned[col].map(lambda v: v.strip() if isinstance(v, str) else v)
 
-    for numeric_col in ["Calculated Area", "Percentage of Space"]:
+    for numeric_col in ["Calculated Area", "Percentage of Space", "Room Area"]:
         if numeric_col in cleaned.columns:
             cleaned[numeric_col] = pd.to_numeric(cleaned[numeric_col], errors="coerce")
 
@@ -60,11 +58,10 @@ def _normalize_header_names(header_values: pd.Series) -> List[str]:
         base_name = value if value else f"Column_{i + 1}"
         if base_name in seen:
             seen[base_name] += 1
-            final_name = f"{base_name}_{seen[base_name]}"
+            names.append(f"{base_name}_{seen[base_name]}")
         else:
             seen[base_name] = 1
-            final_name = base_name
-        names.append(final_name)
+            names.append(base_name)
 
     return names
 
@@ -89,9 +86,6 @@ def load_excel_with_auto_header(uploaded_file: object) -> Tuple[pd.DataFrame, in
     return parsed_df, header_idx, raw_df
 
 
-# ------------------------------
-# Mapping + normalization
-# ------------------------------
 def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     lowered = {c.lower(): c for c in columns}
     for candidate in candidates:
@@ -107,7 +101,7 @@ def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[st
 
 def render_mapping_ui(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     st.subheader("Step 2 · Column Mapping")
-    st.caption("Map your uploaded columns to the strategy schema.")
+    st.caption("Map uploaded columns to the analysis schema.")
 
     show_advanced_cols = st.checkbox("Show advanced columns (incl. Unnamed)", value=False)
     all_cols = list(df.columns)
@@ -132,14 +126,13 @@ def render_mapping_ui(df: pd.DataFrame) -> Dict[str, Optional[str]]:
         guessed = smart_guess_column(mapped_cols, [label])
         options = [none_option] + mapped_cols
         default_value = guessed if guessed in mapped_cols else none_option
-        mapping[key] = st.selectbox(
+        selected = st.selectbox(
             f"Optional: {label}",
             options=options,
             index=options.index(default_value),
             key=f"map_opt_{key}",
         )
-        if mapping[key] == none_option:
-            mapping[key] = None
+        mapping[key] = None if selected == none_option else selected
 
     return mapping
 
@@ -159,9 +152,7 @@ def build_working_df(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.
         working[text_col] = working[text_col].astype("string")
 
     working["calculated_area"] = pd.to_numeric(working["calculated_area"], errors="coerce")
-    working["occupancy"] = pd.to_numeric(working["occupancy"], errors="coerce").fillna(0)
-    working["net_area"] = pd.to_numeric(working["net_area"], errors="coerce")
-    working.loc[working["net_area"].isna(), "net_area"] = working.loc[working["net_area"].isna(), "calculated_area"]
+    working["room_area"] = pd.to_numeric(working["room_area"], errors="coerce")
 
     return working
 
@@ -185,26 +176,53 @@ def required_fields_ready(working_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return len(issues) == 0, issues
 
 
-# ------------------------------
-# Engine + output
-# ------------------------------
-def generate_tasks(working_df: pd.DataFrame, area_threshold: int, target_density: int) -> pd.DataFrame:
+def generate_tasks(working_df: pd.DataFrame, target_density: int) -> pd.DataFrame:
     df = working_df.copy()
 
-    office_mask = df["room_type"].str.lower().eq("office").fillna(False).to_numpy(dtype=bool)
-    area_gt = (df["calculated_area"] > area_threshold).fillna(False).to_numpy(dtype=bool)
-    subdivide_mask = office_mask & area_gt
+    room_type_avg = df.groupby("room_type", dropna=False)["calculated_area"].transform("mean")
+    df["room_type_avg_area"] = room_type_avg
 
-    occupancy_zero = (df["occupancy"] == 0).fillna(False).to_numpy(dtype=bool)
-    net_area_small = (df["net_area"] < 50).fillna(False).to_numpy(dtype=bool)
-    reallocate_mask = occupancy_zero | net_area_small
+    # Integrity rating (data auditing)
+    df["integrity_gap"] = (df["calculated_area"] - df["room_area"]).abs()
+    has_physical_area = df["room_area"].notna()
+    critical_integrity = has_physical_area & (df["integrity_gap"] > INTEGRITY_GAP_THRESHOLD)
 
-    action = np.select([subdivide_mask, reallocate_mask], ["Subdivide", "Reallocate"], default="")
+    df["integrity_score"] = np.select(
+        [critical_integrity.to_numpy(dtype=bool), has_physical_area.to_numpy(dtype=bool)],
+        ["Critical", "Normal"],
+        default="Unknown",
+    )
 
-    tasks = df[action != ""].copy()
-    tasks["action"] = action[action != ""]
-    tasks["current_area"] = tasks["calculated_area"].fillna(0)
-    tasks["potential_area_released"] = (tasks["current_area"] - float(target_density)).clip(lower=0)
+    # Opportunity rating (lean / muda): current area - room-type average
+    df["potential_area_released"] = (df["calculated_area"] - df["room_type_avg_area"]).fillna(0)
+    high_opportunity = (df["potential_area_released"] >= OPPORTUNITY_HIGH_THRESHOLD).to_numpy(dtype=bool)
+    low_opportunity = (~high_opportunity).astype(bool)
+
+    df["opportunity_score"] = np.select(
+        [high_opportunity, low_opportunity],
+        ["High", "Low"],
+        default="Low",
+    )
+
+    # Placeholder slots for future strategy modules
+    df["strategic_alignment_score"] = pd.Series([pd.NA] * len(df), dtype="string")
+    df["relocation_difficulty_score"] = pd.Series([pd.NA] * len(df), dtype="string")
+
+    # Actionable for this stage: critical integrity OR high opportunity
+    actionable_mask = (df["integrity_score"] == "Critical") | (df["opportunity_score"] == "High")
+    tasks = df[actionable_mask].copy()
+
+    tasks["action"] = np.select(
+        [
+            (tasks["integrity_score"] == "Critical").to_numpy(dtype=bool),
+            (tasks["opportunity_score"] == "High").to_numpy(dtype=bool),
+        ],
+        ["Audit Data", "Capture Opportunity"],
+        default="Review",
+    )
+
+    tasks["benchmark_reference"] = tasks["room_type_avg_area"]
+    tasks["target_density_input"] = float(target_density)
 
     return tasks[
         [
@@ -213,11 +231,17 @@ def generate_tasks(working_df: pd.DataFrame, area_threshold: int, target_density
             "room_type",
             "department",
             "building",
-            "occupancy",
-            "net_area",
-            "current_area",
-            "action",
+            "calculated_area",
+            "room_area",
+            "integrity_gap",
+            "integrity_score",
+            "benchmark_reference",
             "potential_area_released",
+            "opportunity_score",
+            "strategic_alignment_score",
+            "relocation_difficulty_score",
+            "action",
+            "target_density_input",
         ]
     ].reset_index(drop=True)
 
@@ -280,7 +304,6 @@ def main() -> None:
         st.error(f"Failed to read Excel file: {exc}")
         return
 
-    # Step 1 - Header alignment
     with st.expander("Step 1 · Header Alignment", expanded=True):
         st.caption(f"Auto-detected header row: Excel row {auto_header_idx + 1}.")
         manual_override = st.toggle("Manually override header row", value=False)
@@ -313,7 +336,6 @@ def main() -> None:
 
     clean_df = clean_dataframe(raw_df)
 
-    # Step 2 - Mapping + readiness
     with st.expander("Step 2 · Column Mapping & Required Field Check", expanded=True):
         mapping = render_mapping_ui(clean_df)
         working_df = build_working_df(clean_df, mapping)
@@ -337,26 +359,24 @@ def main() -> None:
 
     with st.sidebar:
         st.header("Strategy Sandbox")
-        area_threshold = st.slider("Area Threshold (sqft)", 150, 500, 250)
         target_density = st.slider("Target Density (sqft/person)", 80, 200, 120)
 
     scoped = render_filter_sidebar(working_df)
 
-    # Step 3 - engine trigger
-    with st.expander("Step 3 · Run Recommendation Engine", expanded=True):
+    with st.expander("Step 3 · Run Rating Engine", expanded=True):
         st.caption("Actionable tasks are generated only after this step is run.")
-        if st.button("Run task engine", type="primary"):
+        if st.button("Run rating engine", type="primary"):
             st.session_state["engine_confirmed"] = header_key
 
     if st.session_state.get("engine_confirmed") != header_key:
         st.info("Run Step 3 to generate actionable tasks.")
         return
 
-    tasks = generate_tasks(scoped, area_threshold, target_density)
+    tasks = generate_tasks(scoped, target_density)
 
-    total_gain = float(tasks["potential_area_released"].sum()) if not tasks.empty else 0.0
+    total_released = float(tasks["potential_area_released"].clip(lower=0).sum()) if not tasks.empty else 0.0
     st_cols = st.columns(2)
-    st_cols[0].metric("Total Potential Area Gains (sqft)", f"{total_gain:,.0f}")
+    st_cols[0].metric("Total Potential Area Gains (sqft)", f"{total_released:,.0f}")
     st_cols[1].metric("Total Tasks Identified", f"{len(tasks)}")
 
     left, right = st.columns([1.2, 1])
@@ -379,7 +399,7 @@ def main() -> None:
     with right:
         st.subheader("Actionable Tasks")
         if tasks.empty:
-            st.success("No tasks identified for current strategy knobs.")
+            st.success("No tasks identified for current rating setup.")
         else:
             notes_store = st.session_state.setdefault("task_notes", {})
             total_pages = max(int(np.ceil(len(tasks) / TASK_PAGE_SIZE)), 1)
@@ -397,8 +417,9 @@ def main() -> None:
                 task_id = f"{row['room_code']}_{idx}_{row['action']}"
                 with st.container(border=True):
                     st.markdown(
-                        f"**[{row['room_code']}]** | **Floor: {row['floor_code']}** | "
-                        f"**Action: {row['action']}** | **Potential Gain: {row['potential_area_released']:.1f} sqft**"
+                        f"**[{row['room_code']}]** | **Floor: {row['floor_code']}** | **Action: {row['action']}**  \n"
+                        f"Integrity: **{row['integrity_score']}** | Opportunity: **{row['opportunity_score']}** | "
+                        f"Potential: **{row['potential_area_released']:.1f} sqft**"
                     )
                     notes_store[task_id] = st.text_input(
                         "Architectural Notes",
