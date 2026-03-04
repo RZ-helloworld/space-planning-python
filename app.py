@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -37,6 +37,42 @@ def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     return cleaned
 
 
+def _first_non_empty_row(raw_df: pd.DataFrame) -> int:
+    for idx, row in raw_df.iterrows():
+        non_empty = row.dropna().astype(str).str.strip()
+        if (non_empty != "").any():
+            return int(idx)
+    return 0
+
+
+def load_excel_with_auto_header(uploaded_file: st.runtime.uploaded_file_manager.UploadedFile) -> Tuple[pd.DataFrame, int]:
+    file_bytes = uploaded_file.getvalue()
+    raw_df = pd.read_excel(BytesIO(file_bytes), header=None)
+
+    header_row_idx = _first_non_empty_row(raw_df)
+    header_values = raw_df.iloc[header_row_idx].fillna("").astype(str).str.strip()
+
+    column_names: List[str] = []
+    seen: Dict[str, int] = {}
+    for i, header_val in enumerate(header_values):
+        base_name = header_val if header_val else f"Column_{i+1}"
+        if base_name in seen:
+            seen[base_name] += 1
+            final_name = f"{base_name}_{seen[base_name]}"
+        else:
+            seen[base_name] = 1
+            final_name = base_name
+        column_names.append(final_name)
+
+    data_df = raw_df.iloc[header_row_idx + 1 :].copy()
+    data_df.columns = column_names
+
+    data_df = data_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    data_df = data_df.reset_index(drop=True)
+
+    return data_df, header_row_idx
+
+
 def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     lowered = {c.lower(): c for c in columns}
     for candidate in candidates:
@@ -53,7 +89,11 @@ def render_mapping_ui(df: pd.DataFrame) -> Dict[str, Optional[str]]:
     st.subheader("Column Mapping")
     st.caption("Map your file columns to the strategy engine schema.")
 
-    cols = list(df.columns)
+    show_advanced_cols = st.checkbox("Show advanced columns (incl. Unnamed)", value=False)
+    all_cols = list(df.columns)
+    cols = [c for c in all_cols if not str(c).lower().startswith("unnamed:")]
+    if show_advanced_cols or not cols:
+        cols = all_cols
     none_option = "-- Not Provided --"
 
     mapping: Dict[str, Optional[str]] = {}
@@ -171,10 +211,12 @@ def main() -> None:
         return
 
     try:
-        raw_df = pd.read_excel(uploaded_file)
+        raw_df, header_row_idx = load_excel_with_auto_header(uploaded_file)
     except Exception as exc:
         st.error(f"Failed to read Excel file: {exc}")
         return
+
+    st.caption(f"Auto-detected header row: Excel row {header_row_idx + 1}.")
 
     clean_df = clean_dataframe(raw_df)
 

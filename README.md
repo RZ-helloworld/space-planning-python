@@ -18,8 +18,10 @@ streamlit run app.py
 
 - **Robust Data Ingestor (Gatekeeper)**
   - Upload Excel with `st.file_uploader`
+  - Auto header detection: skips leading blank rows and uses the first non-empty row as header (e.g., table starts on row 3)
   - Auto cleaning: trim headers/string values, numeric coercion for `Calculated Area` and `Percentage of Space`
   - Dynamic mapping UI (`st.selectbox`) for required columns: Room Code / Room Type / Calculated Area
+  - Mapping defaults hide `Unnamed:*` columns (toggle available to show advanced columns)
 - **Strategy Sandbox (Sidebar)**
   - Area Threshold slider (`150–500 sqft`)
   - Target Density slider (`80–200 sqft/person`)
