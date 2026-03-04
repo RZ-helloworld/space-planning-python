@@ -11,6 +11,7 @@ st.set_page_config(page_title="Space Strategy Workbench", layout="wide")
 
 REQUIRED_FIELDS = {
     "room_code": "Room Code",
+    "floor_code": "Floor Code",
     "room_type": "Room Type",
     "calculated_area": "Calculated Area",
 }
@@ -154,6 +155,7 @@ def build_working_df(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.
             working[key] = np.nan
 
     working["room_code"] = working["room_code"].astype("string")
+    working["floor_code"] = working["floor_code"].astype("string")
     working["room_type"] = working["room_type"].astype("string")
     working["department"] = working["department"].astype("string")
     working["building"] = working["building"].astype("string")
@@ -176,7 +178,7 @@ def required_fields_ready(working_df: pd.DataFrame) -> Tuple[bool, List[str]]:
             continue
 
         has_values = working_df[field_key].notna().any()
-        if field_key in {"room_code", "room_type"}:
+        if field_key in {"room_code", "floor_code", "room_type"}:
             as_text = working_df[field_key].astype("string").str.strip()
             has_values = as_text.replace("<NA>", pd.NA).notna().any()
 
@@ -215,6 +217,7 @@ def generate_tasks(
     tasks = tasks[
         [
             "room_code",
+            "floor_code",
             "room_type",
             "department",
             "building",
@@ -350,12 +353,13 @@ def main() -> None:
 
     with left:
         st.subheader("Inventory View")
-        search = st.text_input("Search inventory (room/department/building)")
+        search = st.text_input("Search inventory (room/floor/department/building)")
         display_df = scoped.copy()
         if search:
             q = search.lower().strip()
             mask = (
                 display_df["room_code"].astype(str).str.lower().str.contains(q, na=False)
+                | display_df["floor_code"].astype(str).str.lower().str.contains(q, na=False)
                 | display_df["department"].astype(str).str.lower().str.contains(q, na=False)
                 | display_df["building"].astype(str).str.lower().str.contains(q, na=False)
             )
@@ -382,7 +386,7 @@ def main() -> None:
                 task_id = f"{row['room_code']}_{idx}_{row['action']}"
                 with st.container(border=True):
                     st.markdown(
-                        f"**[{row['room_code']}]** | **Action: {row['action']}** | "
+                        f"**[{row['room_code']}]** | **Floor: {row['floor_code']}** | **Action: {row['action']}** | "
                         f"**Potential Gain: {row['potential_area_released']:.1f} sqft**"
                     )
                     notes_store[task_id] = st.text_input(
