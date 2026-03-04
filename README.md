@@ -28,13 +28,14 @@ streamlit run app.py
   - Department + Building filters now use dropdown mode (`All` / `Select`) + multi-select
 - **Rating Engine (Current Phase)**
   - **Integrity Score**: `Critical` when `|Calculated Area - Room Area| > 25 sqft` (if Room Area is mapped)
-  - **Opportunity Score**: based on `Calculated Area - room-type average`
+  - **Opportunity Score**: based on `Calculated Area - benchmark area` (FICM-like room-type references)
   - Actionable in this phase: rows marked `Critical` integrity or `High` opportunity
   - Reallocate logic is intentionally disabled in this phase
 - **Staged Confirmation Flow**
   - Step 1: Confirm header alignment before anything else
   - Step 2: Confirm required-field mapping and data readiness
-  - Step 3: Explicitly run task engine before actionable output
+  - Step 3: Review/edit benchmark table by room type
+  - Step 4: Explicitly run rating engine before actionable output
   - Actionable Task cards are paged in batches of 20 per page
 - **Interactive Dashboard**
   - Top metrics (`st.metric`): total potential gains, total tasks

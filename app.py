@@ -22,6 +22,14 @@ OPTIONAL_FIELDS: Dict[str, str] = {
     "room_area": "Room Area",
 }
 
+DEFAULT_ROOM_TYPE_BENCHMARKS: Dict[str, float] = {
+    "office": 240.0,
+    "lab": 300.0,
+    "conference": 180.0,
+    "classroom": 350.0,
+    "support": 120.0,
+}
+
 TASK_PAGE_SIZE = 20
 INTEGRITY_GAP_THRESHOLD = 25.0
 OPPORTUNITY_HIGH_THRESHOLD = 50.0
@@ -176,39 +184,56 @@ def required_fields_ready(working_df: pd.DataFrame) -> Tuple[bool, List[str]]:
     return len(issues) == 0, issues
 
 
-def generate_tasks(working_df: pd.DataFrame, target_density: int) -> pd.DataFrame:
+def build_benchmark_table(working_df: pd.DataFrame) -> pd.DataFrame:
+    room_types = sorted([rt for rt in working_df["room_type"].dropna().astype(str).unique().tolist() if rt != "<NA>"])
+    rows: List[Dict[str, object]] = []
+    for room_type in room_types:
+        key = room_type.strip().lower()
+        rows.append({
+            "room_type": room_type,
+            "benchmark_area": DEFAULT_ROOM_TYPE_BENCHMARKS.get(key, 240.0),
+        })
+    return pd.DataFrame(rows)
+
+
+def generate_tasks(working_df: pd.DataFrame, target_density: int, benchmark_df: pd.DataFrame) -> pd.DataFrame:
     df = working_df.copy()
 
-    room_type_avg = df.groupby("room_type", dropna=False)["calculated_area"].transform("mean")
-    df["room_type_avg_area"] = room_type_avg
+    benchmark_map = {
+        str(row.room_type).strip().lower(): float(row.benchmark_area)
+        for row in benchmark_df.itertuples(index=False)
+        if pd.notna(row.room_type) and pd.notna(row.benchmark_area)
+    }
 
-    # Integrity rating (data auditing)
+    df["benchmark_reference"] = (
+        df["room_type"].astype(str).str.strip().str.lower().map(benchmark_map)
+    )
+
+    # Integrity score: auditing gap between calculated and physical area.
     df["integrity_gap"] = (df["calculated_area"] - df["room_area"]).abs()
-    has_physical_area = df["room_area"].notna()
-    critical_integrity = has_physical_area & (df["integrity_gap"] > INTEGRITY_GAP_THRESHOLD)
+    has_physical_area = df["room_area"].notna().to_numpy(dtype=bool)
+    critical_integrity = (df["integrity_gap"] > INTEGRITY_GAP_THRESHOLD).fillna(False).to_numpy(dtype=bool)
 
     df["integrity_score"] = np.select(
-        [critical_integrity.to_numpy(dtype=bool), has_physical_area.to_numpy(dtype=bool)],
+        [has_physical_area & critical_integrity, has_physical_area],
         ["Critical", "Normal"],
         default="Unknown",
     )
 
-    # Opportunity rating (lean / muda): current area - room-type average
-    df["potential_area_released"] = (df["calculated_area"] - df["room_type_avg_area"]).fillna(0)
-    high_opportunity = (df["potential_area_released"] >= OPPORTUNITY_HIGH_THRESHOLD).to_numpy(dtype=bool)
-    low_opportunity = (~high_opportunity).astype(bool)
+    # Opportunity score: current area minus FICM-like room-type benchmark.
+    df["potential_area_released"] = (df["calculated_area"] - df["benchmark_reference"]).fillna(0)
+    high_opportunity = (df["potential_area_released"] >= OPPORTUNITY_HIGH_THRESHOLD).fillna(False).to_numpy(dtype=bool)
 
     df["opportunity_score"] = np.select(
-        [high_opportunity, low_opportunity],
-        ["High", "Low"],
+        [high_opportunity],
+        ["High"],
         default="Low",
     )
 
-    # Placeholder slots for future strategy modules
+    # Reserved slots for future strategic modules.
     df["strategic_alignment_score"] = pd.Series([pd.NA] * len(df), dtype="string")
     df["relocation_difficulty_score"] = pd.Series([pd.NA] * len(df), dtype="string")
 
-    # Actionable for this stage: critical integrity OR high opportunity
     actionable_mask = (df["integrity_score"] == "Critical") | (df["opportunity_score"] == "High")
     tasks = df[actionable_mask].copy()
 
@@ -221,7 +246,6 @@ def generate_tasks(working_df: pd.DataFrame, target_density: int) -> pd.DataFram
         default="Review",
     )
 
-    tasks["benchmark_reference"] = tasks["room_type_avg_area"]
     tasks["target_density_input"] = float(target_density)
 
     return tasks[
@@ -363,16 +387,26 @@ def main() -> None:
 
     scoped = render_filter_sidebar(working_df)
 
-    with st.expander("Step 3 · Run Rating Engine", expanded=True):
+    with st.expander("Step 3 · Configure Benchmarks", expanded=False):
+        st.caption("Review/edit room-type benchmark area (FICM-like references).")
+        benchmark_default = build_benchmark_table(scoped)
+        benchmark_df = st.data_editor(
+            benchmark_default,
+            use_container_width=True,
+            num_rows="dynamic",
+            key="benchmark_editor",
+        )
+
+    with st.expander("Step 4 · Run Rating Engine", expanded=True):
         st.caption("Actionable tasks are generated only after this step is run.")
         if st.button("Run rating engine", type="primary"):
             st.session_state["engine_confirmed"] = header_key
 
     if st.session_state.get("engine_confirmed") != header_key:
-        st.info("Run Step 3 to generate actionable tasks.")
+        st.info("Run Step 4 to generate actionable tasks.")
         return
 
-    tasks = generate_tasks(scoped, target_density)
+    tasks = generate_tasks(scoped, target_density, benchmark_df)
 
     total_released = float(tasks["potential_area_released"].clip(lower=0).sum()) if not tasks.empty else 0.0
     st_cols = st.columns(2)
