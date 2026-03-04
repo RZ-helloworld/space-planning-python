@@ -193,10 +193,13 @@ def generate_tasks(
 ) -> pd.DataFrame:
     df = working_df.copy()
 
-    office_mask = df["room_type"].str.lower().eq("office")
-    subdivide_mask = office_mask & (df["calculated_area"] > area_threshold)
+    office_mask = df["room_type"].str.lower().eq("office").fillna(False).to_numpy(dtype=bool)
+    area_gt_threshold = (df["calculated_area"] > area_threshold).fillna(False).to_numpy(dtype=bool)
+    subdivide_mask = office_mask & area_gt_threshold
 
-    reallocate_mask = (df["occupancy"] == 0) | (df["net_area"] < 50)
+    occupancy_zero = (df["occupancy"] == 0).fillna(False).to_numpy(dtype=bool)
+    net_area_small = (df["net_area"] < 50).fillna(False).to_numpy(dtype=bool)
+    reallocate_mask = occupancy_zero | net_area_small
 
     action = np.select(
         [subdivide_mask, reallocate_mask],
