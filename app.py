@@ -9,24 +9,29 @@ import streamlit as st
 
 st.set_page_config(page_title="Space Strategy Workbench", layout="wide")
 
-REQUIRED_FIELDS = {
+REQUIRED_FIELDS: Dict[str, str] = {
     "room_code": "Room Code",
     "floor_code": "Floor Code",
     "room_type": "Room Type",
     "calculated_area": "Calculated Area",
 }
-OPTIONAL_FIELDS = {
+
+OPTIONAL_FIELDS: Dict[str, str] = {
     "department": "Department",
     "building": "Building",
     "occupancy": "Occupancy",
     "net_area": "Net Area",
 }
+
 TASK_PAGE_SIZE = 20
 
 
+# ------------------------------
+# Ingest + preprocessing
+# ------------------------------
 def clean_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = df.copy()
-    cleaned.columns = [str(c).strip() for c in cleaned.columns]
+    cleaned.columns = [str(col).strip() for col in cleaned.columns]
 
     object_cols = cleaned.select_dtypes(include=["object", "string"]).columns
     for col in object_cols:
@@ -47,52 +52,52 @@ def _first_non_empty_row(raw_df: pd.DataFrame) -> int:
     return 0
 
 
-def _build_column_names(header_values: pd.Series) -> List[str]:
-    column_names: List[str] = []
+def _normalize_header_names(header_values: pd.Series) -> List[str]:
+    names: List[str] = []
     seen: Dict[str, int] = {}
 
-    for i, header_val in enumerate(header_values.fillna("").astype(str).str.strip()):
-        base_name = header_val if header_val else f"Column_{i+1}"
+    for i, value in enumerate(header_values.fillna("").astype(str).str.strip()):
+        base_name = value if value else f"Column_{i + 1}"
         if base_name in seen:
             seen[base_name] += 1
             final_name = f"{base_name}_{seen[base_name]}"
         else:
             seen[base_name] = 1
             final_name = base_name
-        column_names.append(final_name)
+        names.append(final_name)
 
-    return column_names
+    return names
 
 
 def parse_excel_with_header_row(raw_df: pd.DataFrame, header_row_idx: int) -> pd.DataFrame:
     if raw_df.empty:
         return pd.DataFrame()
 
-    max_idx = len(raw_df.index) - 1
-    safe_header_idx = min(max(header_row_idx, 0), max_idx)
+    safe_idx = min(max(header_row_idx, 0), len(raw_df.index) - 1)
+    col_names = _normalize_header_names(raw_df.iloc[safe_idx])
 
-    header_values = raw_df.iloc[safe_header_idx]
-    column_names = _build_column_names(header_values)
-
-    data_df = raw_df.iloc[safe_header_idx + 1 :].copy()
-    data_df.columns = column_names
-    data_df = data_df.dropna(axis=0, how="all").dropna(axis=1, how="all")
-    return data_df.reset_index(drop=True)
+    parsed = raw_df.iloc[safe_idx + 1 :].copy()
+    parsed.columns = col_names
+    parsed = parsed.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    return parsed.reset_index(drop=True)
 
 
 def load_excel_with_auto_header(uploaded_file: object) -> Tuple[pd.DataFrame, int, pd.DataFrame]:
-    file_bytes = uploaded_file.getvalue()
-    raw_df = pd.read_excel(BytesIO(file_bytes), header=None)
-    header_row_idx = _first_non_empty_row(raw_df)
-    data_df = parse_excel_with_header_row(raw_df, header_row_idx)
-    return data_df, header_row_idx, raw_df
+    raw_df = pd.read_excel(BytesIO(uploaded_file.getvalue()), header=None)
+    header_idx = _first_non_empty_row(raw_df)
+    parsed_df = parse_excel_with_header_row(raw_df, header_idx)
+    return parsed_df, header_idx, raw_df
 
 
+# ------------------------------
+# Mapping + normalization
+# ------------------------------
 def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[str]:
     lowered = {c.lower(): c for c in columns}
     for candidate in candidates:
         if candidate.lower() in lowered:
             return lowered[candidate.lower()]
+
     for col in columns:
         for candidate in candidates:
             if candidate.lower() in col.lower():
@@ -101,41 +106,40 @@ def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[st
 
 
 def render_mapping_ui(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    st.subheader("Column Mapping")
-    st.caption("Map your file columns to the strategy engine schema.")
+    st.subheader("Step 2 · Column Mapping")
+    st.caption("Map your uploaded columns to the strategy schema.")
 
     show_advanced_cols = st.checkbox("Show advanced columns (incl. Unnamed)", value=False)
     all_cols = list(df.columns)
-    cols = [c for c in all_cols if not str(c).lower().startswith("unnamed:")]
-    if show_advanced_cols or not cols:
-        cols = all_cols
-    none_option = "-- Not Provided --"
+    mapped_cols = [c for c in all_cols if not str(c).lower().startswith("unnamed:")]
+    if show_advanced_cols or not mapped_cols:
+        mapped_cols = all_cols
 
     mapping: Dict[str, Optional[str]] = {}
+    none_option = "-- Not Provided --"
 
     for key, label in REQUIRED_FIELDS.items():
-        guessed = smart_guess_column(cols, [label])
-        default_idx = cols.index(guessed) if guessed in cols else 0
-        chosen = st.selectbox(
-            f"Map required field: {label}",
-            options=cols,
+        guessed = smart_guess_column(mapped_cols, [label])
+        default_idx = mapped_cols.index(guessed) if guessed in mapped_cols else 0
+        mapping[key] = st.selectbox(
+            f"Required: {label}",
+            options=mapped_cols,
             index=default_idx,
-            key=f"map_{key}",
+            key=f"map_req_{key}",
         )
-        mapping[key] = chosen
 
     for key, label in OPTIONAL_FIELDS.items():
-        guessed = smart_guess_column(cols, [label])
-        options = [none_option] + cols
-        default_value = guessed if guessed in cols else none_option
-        default_idx = options.index(default_value)
-        chosen = st.selectbox(
-            f"Map optional field: {label}",
+        guessed = smart_guess_column(mapped_cols, [label])
+        options = [none_option] + mapped_cols
+        default_value = guessed if guessed in mapped_cols else none_option
+        mapping[key] = st.selectbox(
+            f"Optional: {label}",
             options=options,
-            index=default_idx,
+            index=options.index(default_value),
             key=f"map_opt_{key}",
         )
-        mapping[key] = None if chosen == none_option else chosen
+        if mapping[key] == none_option:
+            mapping[key] = None
 
     return mapping
 
@@ -149,72 +153,60 @@ def build_working_df(df: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.
 
     for key in OPTIONAL_FIELDS:
         source_col = mapping.get(key)
-        if source_col and source_col in df.columns:
-            working[key] = df[source_col]
-        else:
-            working[key] = np.nan
+        working[key] = df[source_col] if source_col in df.columns else np.nan
 
-    working["room_code"] = working["room_code"].astype("string")
-    working["floor_code"] = working["floor_code"].astype("string")
-    working["room_type"] = working["room_type"].astype("string")
-    working["department"] = working["department"].astype("string")
-    working["building"] = working["building"].astype("string")
+    for text_col in ["room_code", "floor_code", "room_type", "department", "building"]:
+        working[text_col] = working[text_col].astype("string")
 
     working["calculated_area"] = pd.to_numeric(working["calculated_area"], errors="coerce")
     working["occupancy"] = pd.to_numeric(working["occupancy"], errors="coerce").fillna(0)
     working["net_area"] = pd.to_numeric(working["net_area"], errors="coerce")
-
-    missing_net_area = working["net_area"].isna()
-    working.loc[missing_net_area, "net_area"] = working.loc[missing_net_area, "calculated_area"]
+    working.loc[working["net_area"].isna(), "net_area"] = working.loc[working["net_area"].isna(), "calculated_area"]
 
     return working
 
 
 def required_fields_ready(working_df: pd.DataFrame) -> Tuple[bool, List[str]]:
-    missing_reasons: List[str] = []
+    issues: List[str] = []
+
     for field_key, field_label in REQUIRED_FIELDS.items():
         if field_key not in working_df.columns:
-            missing_reasons.append(f"Missing required mapped column: {field_label}")
+            issues.append(f"Missing required mapped column: {field_label}")
             continue
 
         has_values = working_df[field_key].notna().any()
         if field_key in {"room_code", "floor_code", "room_type"}:
-            as_text = working_df[field_key].astype("string").str.strip()
-            has_values = as_text.replace("<NA>", pd.NA).notna().any()
+            text = working_df[field_key].astype("string").str.strip().replace("<NA>", pd.NA)
+            has_values = text.notna().any()
 
         if not has_values:
-            missing_reasons.append(f"Required field has no usable values: {field_label}")
+            issues.append(f"Required field has no usable values: {field_label}")
 
-    return len(missing_reasons) == 0, missing_reasons
+    return len(issues) == 0, issues
 
 
-def generate_tasks(
-    working_df: pd.DataFrame,
-    area_threshold: int,
-    target_density: int,
-) -> pd.DataFrame:
+# ------------------------------
+# Engine + output
+# ------------------------------
+def generate_tasks(working_df: pd.DataFrame, area_threshold: int, target_density: int) -> pd.DataFrame:
     df = working_df.copy()
 
     office_mask = df["room_type"].str.lower().eq("office").fillna(False).to_numpy(dtype=bool)
-    area_gt_threshold = (df["calculated_area"] > area_threshold).fillna(False).to_numpy(dtype=bool)
-    subdivide_mask = office_mask & area_gt_threshold
+    area_gt = (df["calculated_area"] > area_threshold).fillna(False).to_numpy(dtype=bool)
+    subdivide_mask = office_mask & area_gt
 
     occupancy_zero = (df["occupancy"] == 0).fillna(False).to_numpy(dtype=bool)
     net_area_small = (df["net_area"] < 50).fillna(False).to_numpy(dtype=bool)
     reallocate_mask = occupancy_zero | net_area_small
 
-    action = np.select(
-        [subdivide_mask, reallocate_mask],
-        ["Subdivide", "Reallocate"],
-        default="",
-    )
+    action = np.select([subdivide_mask, reallocate_mask], ["Subdivide", "Reallocate"], default="")
 
     tasks = df[action != ""].copy()
     tasks["action"] = action[action != ""]
     tasks["current_area"] = tasks["calculated_area"].fillna(0)
     tasks["potential_area_released"] = (tasks["current_area"] - float(target_density)).clip(lower=0)
 
-    tasks = tasks[
+    return tasks[
         [
             "room_code",
             "floor_code",
@@ -229,14 +221,42 @@ def generate_tasks(
         ]
     ].reset_index(drop=True)
 
-    return tasks
-
 
 def tasks_to_excel_bytes(df_tasks: pd.DataFrame) -> bytes:
     output = BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         df_tasks.to_excel(writer, index=False, sheet_name="strategy_tasks")
     return output.getvalue()
+
+
+def render_filter_sidebar(working_df: pd.DataFrame) -> pd.DataFrame:
+    dept_options = sorted([d for d in working_df["department"].dropna().unique().tolist() if str(d) != "<NA>"])
+    bldg_options = sorted([b for b in working_df["building"].dropna().unique().tolist() if str(b) != "<NA>"])
+
+    with st.sidebar:
+        st.subheader("Filter Mode")
+
+        dept_mode = st.selectbox("Department Filter Mode", ["All Departments", "Select Departments"], index=0)
+        selected_depts = (
+            dept_options
+            if dept_mode == "All Departments"
+            else st.multiselect("Department Filter (Multi-select)", dept_options, default=dept_options)
+        )
+
+        bldg_mode = st.selectbox("Building Filter Mode", ["All Buildings", "Select Buildings"], index=0)
+        selected_bldgs = (
+            bldg_options
+            if bldg_mode == "All Buildings"
+            else st.multiselect("Building Filter (Multi-select)", bldg_options, default=bldg_options)
+        )
+
+    scoped = working_df.copy()
+    if dept_mode == "Select Departments":
+        scoped = scoped[scoped["department"].isin(selected_depts)]
+    if bldg_mode == "Select Buildings":
+        scoped = scoped[scoped["building"].isin(selected_bldgs)]
+
+    return scoped
 
 
 def main() -> None:
@@ -248,111 +268,83 @@ def main() -> None:
         st.info("Upload a file to begin scenario analysis.")
         return
 
-    file_signature = f"{uploaded_file.name}_{uploaded_file.size}"
     st.session_state.setdefault("header_confirmed", None)
     st.session_state.setdefault("mapping_confirmed", None)
     st.session_state.setdefault("engine_confirmed", None)
 
+    file_key = f"{uploaded_file.name}_{uploaded_file.size}"
+
     try:
-        auto_df, auto_header_row_idx, raw_excel_df = load_excel_with_auto_header(uploaded_file)
+        _, auto_header_idx, raw_excel_df = load_excel_with_auto_header(uploaded_file)
     except Exception as exc:
         st.error(f"Failed to read Excel file: {exc}")
         return
 
-    max_excel_row = max(len(raw_excel_df.index), 1)
+    # Step 1 - Header alignment
     with st.expander("Step 1 · Header Alignment", expanded=True):
-        st.caption(f"Auto-detected header row: Excel row {auto_header_row_idx + 1}.")
+        st.caption(f"Auto-detected header row: Excel row {auto_header_idx + 1}.")
         manual_override = st.toggle("Manually override header row", value=False)
 
-        selected_excel_row = auto_header_row_idx + 1
+        selected_row_1based = auto_header_idx + 1
         if manual_override:
-            selected_excel_row = st.number_input(
+            selected_row_1based = st.number_input(
                 "Header row number in Excel (1-based)",
                 min_value=1,
-                max_value=max_excel_row,
-                value=min(auto_header_row_idx + 1, max_excel_row),
+                max_value=max(len(raw_excel_df.index), 1),
+                value=min(auto_header_idx + 1, max(len(raw_excel_df.index), 1)),
                 step=1,
             )
 
-        selected_header_idx = int(selected_excel_row - 1)
-        raw_df = parse_excel_with_header_row(raw_excel_df, selected_header_idx)
+        header_idx = int(selected_row_1based - 1)
+        raw_df = parse_excel_with_header_row(raw_excel_df, header_idx)
 
         st.write("Detected columns:", list(raw_df.columns))
         st.dataframe(raw_df.head(5), use_container_width=True, hide_index=True)
 
         if st.button("Confirm header alignment", type="primary"):
-            st.session_state["header_confirmed"] = f"{file_signature}_{selected_header_idx}"
+            st.session_state["header_confirmed"] = f"{file_key}_{header_idx}"
             st.session_state["mapping_confirmed"] = None
             st.session_state["engine_confirmed"] = None
 
-    header_key = f"{file_signature}_{selected_header_idx}"
+    header_key = f"{file_key}_{header_idx}"
     if st.session_state.get("header_confirmed") != header_key:
-        st.warning("Please confirm header alignment to continue to column mapping.")
+        st.warning("Please confirm header alignment to continue.")
         return
 
     clean_df = clean_dataframe(raw_df)
 
+    # Step 2 - Mapping + readiness
     with st.expander("Step 2 · Column Mapping & Required Field Check", expanded=True):
         mapping = render_mapping_ui(clean_df)
         working_df = build_working_df(clean_df, mapping)
 
-        is_ready, reasons = required_fields_ready(working_df)
-        if is_ready:
-            st.success("Required fields are mapped and contain usable values.")
+        ready, issues = required_fields_ready(working_df)
+        if ready:
+            st.success("Required fields are mapped and usable.")
         else:
-            for reason in reasons:
-                st.error(reason)
+            for issue in issues:
+                st.error(issue)
 
-        if st.button("Confirm mapping and unlock strategy step", type="primary", disabled=not is_ready):
+        if st.button("Confirm mapping and unlock strategy step", type="primary", disabled=not ready):
             st.session_state["mapping_confirmed"] = header_key
             st.session_state["engine_confirmed"] = None
 
     if st.session_state.get("mapping_confirmed") != header_key:
-        st.warning("Please complete Step 2 before running strategy and generating actionable tasks.")
+        st.warning("Please complete Step 2 before running strategy and tasks.")
         return
 
     working_df = build_working_df(clean_df, mapping)
 
     with st.sidebar:
         st.header("Strategy Sandbox")
-        area_threshold = st.slider("Area Threshold (sqft)", min_value=150, max_value=500, value=250)
-        target_density = st.slider("Target Density (sqft/person)", min_value=80, max_value=200, value=120)
+        area_threshold = st.slider("Area Threshold (sqft)", 150, 500, 250)
+        target_density = st.slider("Target Density (sqft/person)", 80, 200, 120)
 
-    dept_options = sorted([d for d in working_df["department"].dropna().unique().tolist() if str(d) != "<NA>"])
-    bldg_options = sorted([b for b in working_df["building"].dropna().unique().tolist() if str(b) != "<NA>"])
+    scoped = render_filter_sidebar(working_df)
 
-    with st.sidebar:
-        st.subheader("Filter Mode")
-        dept_filter_mode = st.selectbox(
-            "Department Filter Mode",
-            options=["All Departments", "Select Departments"],
-            index=0,
-        )
-        selected_depts = (
-            dept_options
-            if dept_filter_mode == "All Departments"
-            else st.multiselect("Department Filter (Multi-select)", options=dept_options, default=dept_options)
-        )
-
-        bldg_filter_mode = st.selectbox(
-            "Building Filter Mode",
-            options=["All Buildings", "Select Buildings"],
-            index=0,
-        )
-        selected_bldgs = (
-            bldg_options
-            if bldg_filter_mode == "All Buildings"
-            else st.multiselect("Building Filter (Multi-select)", options=bldg_options, default=bldg_options)
-        )
-
-    scoped = working_df.copy()
-    if dept_filter_mode == "Select Departments":
-        scoped = scoped[scoped["department"].isin(selected_depts)]
-    if bldg_filter_mode == "Select Buildings":
-        scoped = scoped[scoped["building"].isin(selected_bldgs)]
-
+    # Step 3 - engine trigger
     with st.expander("Step 3 · Run Recommendation Engine", expanded=True):
-        st.caption("Task generation is locked until you explicitly run this step.")
+        st.caption("Actionable tasks are generated only after this step is run.")
         if st.button("Run task engine", type="primary"):
             st.session_state["engine_confirmed"] = header_key
 
@@ -360,14 +352,12 @@ def main() -> None:
         st.info("Run Step 3 to generate actionable tasks.")
         return
 
-    tasks = generate_tasks(scoped, area_threshold=area_threshold, target_density=target_density)
+    tasks = generate_tasks(scoped, area_threshold, target_density)
 
     total_gain = float(tasks["potential_area_released"].sum()) if not tasks.empty else 0.0
-    total_tasks = int(len(tasks))
-
-    m1, m2 = st.columns(2)
-    m1.metric("Total Potential Area Gains (sqft)", f"{total_gain:,.0f}")
-    m2.metric("Total Tasks Identified", f"{total_tasks}")
+    st_cols = st.columns(2)
+    st_cols[0].metric("Total Potential Area Gains (sqft)", f"{total_gain:,.0f}")
+    st_cols[1].metric("Total Tasks Identified", f"{len(tasks)}")
 
     left, right = st.columns([1.2, 1])
 
@@ -392,22 +382,23 @@ def main() -> None:
             st.success("No tasks identified for current strategy knobs.")
         else:
             notes_store = st.session_state.setdefault("task_notes", {})
-            total_pages = int(np.ceil(len(tasks) / TASK_PAGE_SIZE))
-            page = st.number_input("Task page", min_value=1, max_value=max(total_pages, 1), value=1, step=1)
-            start_idx = int((page - 1) * TASK_PAGE_SIZE)
+            total_pages = max(int(np.ceil(len(tasks) / TASK_PAGE_SIZE)), 1)
+            page = int(st.number_input("Task page", min_value=1, max_value=total_pages, value=1, step=1))
+            start_idx = (page - 1) * TASK_PAGE_SIZE
             end_idx = min(start_idx + TASK_PAGE_SIZE, len(tasks))
-            tasks_page = tasks.iloc[start_idx:end_idx]
+            page_df = tasks.iloc[start_idx:end_idx]
+
             st.caption(
                 f"Showing tasks {start_idx + 1}-{end_idx} of {len(tasks)} "
                 f"(page {page}/{total_pages}, {TASK_PAGE_SIZE} per page)."
             )
 
-            for idx, row in tasks_page.iterrows():
+            for idx, row in page_df.iterrows():
                 task_id = f"{row['room_code']}_{idx}_{row['action']}"
                 with st.container(border=True):
                     st.markdown(
-                        f"**[{row['room_code']}]** | **Floor: {row['floor_code']}** | **Action: {row['action']}** | "
-                        f"**Potential Gain: {row['potential_area_released']:.1f} sqft**"
+                        f"**[{row['room_code']}]** | **Floor: {row['floor_code']}** | "
+                        f"**Action: {row['action']}** | **Potential Gain: {row['potential_area_released']:.1f} sqft**"
                     )
                     notes_store[task_id] = st.text_input(
                         "Architectural Notes",
