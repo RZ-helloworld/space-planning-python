@@ -94,3 +94,21 @@ print(stages["df_final"].head())
 - `df_final`: floor summary table
 - `discrepancy_outliers`: rows with discrepancy > 1 sqft
 
+## Space Strategy Workbench (Streamlit App)
+
+Interactive web app that treats space as inventory (WMS logic): upload an Excel
+space list, tune strategy sliders, and get a prioritized optimization task list.
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+- **Data Ingestor**: drag-and-drop Excel upload, auto header cleaning, manual column mapping fallback
+- **Strategy Sandbox**: Area Threshold (150-500 sqft) and Target Density (80-200 sqft/person) sliders + building/department filters
+- **Task Engine**: SUBDIVIDE / REALLOCATE / AUDIT DATA rules with 3-dimension priority scoring (Urgent / High / Planning)
+- **Export**: task list with your architectural notes downloads as Excel
+
+> 数据隐私:仓库中不含任何真实数据。数据经 `st.file_uploader` 在会话内处理,不落盘、不上传到仓库。
+
+Deploy free on [Streamlit Community Cloud](https://share.streamlit.io): New app -> pick this repo -> `app.py` -> Deploy.
