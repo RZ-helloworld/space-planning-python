@@ -1,437 +1,450 @@
-"""
-Space Strategy Workbench
-========================
-A Streamlit app that treats architectural space as inventory (WMS logic).
-Upload a space list (Excel), tune strategy parameters with sliders, and
-instantly generate a prioritized "Actionable Task List" for master planning.
-
-Run:
-    streamlit run app.py
-
-Architecture (modular — logic decoupled from UI):
-    1. Data Ingestor   -> load_uploaded_file / clean_data / resolve_columns
-    2. Task Engine     -> generate_tasks / calculate_task_priority
-    3. Dashboard UI    -> main()
-    4. Export          -> build_excel_report
-"""
-
 from __future__ import annotations
 
+import hashlib
 import io
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-# Reuse cleaning helpers from the existing pipeline module when available.
-try:
-    from space_programming_pipeline import _strip_dataframe_strings
-except ImportError:  # fallback so app.py also works standalone
-    def _strip_dataframe_strings(df: pd.DataFrame) -> pd.DataFrame:
-        cleaned = df.copy()
-        cleaned.columns = [str(col).strip() for col in cleaned.columns]
-        object_cols = cleaned.select_dtypes(include=["object", "string"]).columns
-        for col in object_cols:
-            cleaned[col] = cleaned[col].map(
-                lambda v: v.strip() if isinstance(v, str) else v
-            )
-        return cleaned
+from engine import (
+    build_benchmark_table,
+    generate_tasks,
+    mark_benchmark_sources,
+)
+from space_programming_pipeline import build_canonical_inventory
 
+st.set_page_config(page_title="Space Strategy Workbench", page_icon="🏗️", layout="wide")
 
-# ---------------------------------------------------------------------------
-# 0. Constants
-# ---------------------------------------------------------------------------
-
-LOGICAL_FIELDS: Dict[str, dict] = {
-    # logical name -> {label, candidates (auto-detect), required}
-    "room_code": {
-        "label": "Room Code",
-        "candidates": ["Room Code", "Room Number", "Room", "RM"],
-        "required": True,
-    },
-    "room_type": {
-        "label": "Room Type",
-        "candidates": ["Room Type", "Space Type", "Room Use", "Type"],
-        "required": True,
-    },
-    "calculated_area": {
-        "label": "Calculated Area (sqft)",
-        "candidates": ["Calculated Area", "Area", "Net Area", "ASF"],
-        "required": True,
-    },
-    "building": {
-        "label": "Building",
-        "candidates": ["Building Code", "Building", "Bldg"],
-        "required": False,
-    },
-    "department": {
-        "label": "Department",
-        "candidates": ["Department", "Dept", "Org", "Division"],
-        "required": False,
-    },
-    "room_area": {
-        "label": "Room Area (gross)",
-        "candidates": ["Room Area"],
-        "required": False,
-    },
-    "percentage": {
-        "label": "Percentage of Space",
-        "candidates": ["Percentage of Space", "Percentage", "Pct"],
-        "required": False,
-    },
-    "occupancy": {
-        "label": "Occupancy (headcount)",
-        "candidates": ["Occupancy", "Headcount", "Occupants", "Seats"],
-        "required": False,
-    },
+REQUIRED_FIELDS: Dict[str, str] = {
+    "room_code": "Room Code",
+    "ficm_code": "FICM Code",
+    "room_type": "Room Type",
+    "calculated_area": "Calculated Area",
 }
 
-NOT_MAPPED = "— not mapped —"
+OPTIONAL_FIELDS: Dict[str, str] = {
+    "floor_code": "Floor Code",
+    "department": "Department",
+    "building": "Building",
+    "room_area": "Room Area",
+    "percentage": "Percentage of Space",
+    "occupancy": "Occupancy",
+}
+
+CANDIDATES: Dict[str, List[str]] = {
+    "room_code": ["Room Code", "Room Number", "Room", "RM"],
+    "ficm_code": [
+        "Room Category",
+        "FICM Code",
+        "FICM",
+        "Space Category",
+        "Category",
+    ],
+    "room_type": ["Room Type", "Space Type", "Room Use", "Type"],
+    "calculated_area": ["Calculated Area", "Area", "Net Area", "ASF"],
+    "floor_code": ["Floor Code", "Floor", "Level"],
+    "department": ["Department", "Dept", "Org", "Division"],
+    "building": ["Building Code", "Building", "Bldg"],
+    "room_area": ["Room Area", "Gross Room Area"],
+    "percentage": ["Percentage of Space", "Percentage", "Pct"],
+    "occupancy": ["Occupancy", "Headcount", "Occupants", "Seats"],
+}
+
+TASK_PAGE_SIZE = 20
+NOT_PROVIDED = "-- Not Provided --"
 
 
-# ---------------------------------------------------------------------------
-# 1. Data Ingestor (The Gatekeeper)
-# ---------------------------------------------------------------------------
+def build_demo_raw_excel() -> pd.DataFrame:
+    """Return a small workbook-shaped preview with its header on Excel row 3."""
+    demo = pd.DataFrame(
+        {
+            "Room Code": ["03", "102", "201", "S-1"],
+            "Floor Code": ["01", "01", "02", "B1"],
+            "Room Category": ["310", "350", "250", "610"],
+            "Room Type": ["Office", "Collaboration Space", "Lab", "Support"],
+            "Calculated Area": [60, 320, 400, 120],
+            "Room Area": [100, 220, 400, 120],
+            "Percentage": [60, 100, 100, 100],
+            "Department": ["Strategy", "Strategy", "Research", "Operations"],
+            "Building": ["Demo", "Demo", "Demo", "Demo"],
+        }
+    )
+    blank = [np.nan] * len(demo.columns)
+    return pd.DataFrame([blank, blank, list(demo.columns), *demo.values.tolist()])
 
-@st.cache_data(show_spinner="Reading Excel file...")
-def load_uploaded_file(file_bytes: bytes, sheet_name: str, header_row: int) -> pd.DataFrame:
-    """Read an uploaded Excel file into a raw DataFrame."""
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, header=header_row)
+
+def _first_non_empty_row(raw_df: pd.DataFrame) -> int:
+    for index, row in raw_df.iterrows():
+        non_empty = row.dropna().astype(str).str.strip()
+        if (non_empty != "").any():
+            return int(index)
+    return 0
 
 
-def auto_detect_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Case-insensitive auto-detection of a physical column name."""
-    lookup = {str(c).strip().lower(): c for c in df.columns}
-    for cand in candidates:
-        if cand.lower() in lookup:
-            return lookup[cand.lower()]
+def _normalize_header_names(header_values: pd.Series) -> List[str]:
+    names: List[str] = []
+    seen: Dict[str, int] = {}
+    for index, value in enumerate(header_values.fillna("").astype(str).str.strip()):
+        base_name = value if value else f"Column_{index + 1}"
+        seen[base_name] = seen.get(base_name, 0) + 1
+        suffix = "" if seen[base_name] == 1 else f"_{seen[base_name]}"
+        names.append(f"{base_name}{suffix}")
+    return names
+
+
+def parse_excel_with_header_row(
+    raw_df: pd.DataFrame, header_row_index: int
+) -> pd.DataFrame:
+    if raw_df.empty:
+        return pd.DataFrame()
+    safe_index = min(max(header_row_index, 0), len(raw_df.index) - 1)
+    parsed = raw_df.iloc[safe_index + 1 :].copy()
+    parsed.columns = _normalize_header_names(raw_df.iloc[safe_index])
+    parsed = parsed.dropna(axis=0, how="all").dropna(axis=1, how="all")
+    return parsed.reset_index(drop=True)
+
+
+def read_uploaded_excel(uploaded_file: object) -> Tuple[pd.DataFrame, int]:
+    raw = pd.read_excel(io.BytesIO(uploaded_file.getvalue()), header=None)
+    return raw, _first_non_empty_row(raw)
+
+
+def smart_guess_column(columns: List[str], candidates: List[str]) -> Optional[str]:
+    lowered = {str(column).strip().lower(): column for column in columns}
+    for candidate in candidates:
+        if candidate.lower() in lowered:
+            return str(lowered[candidate.lower()])
+    for column in columns:
+        if any(candidate.lower() in column.lower() for candidate in candidates):
+            return column
     return None
 
 
-def resolve_columns(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    """Auto-map logical fields; fall back to manual selectboxes when unresolved."""
+def render_mapping_ui(df: pd.DataFrame, state_key: str) -> Dict[str, Optional[str]]:
+    columns = [str(column) for column in df.columns]
     mapping: Dict[str, Optional[str]] = {}
-    unresolved: List[str] = []
 
-    for logical, spec in LOGICAL_FIELDS.items():
-        found = auto_detect_column(df, spec["candidates"])
-        mapping[logical] = found
-        if found is None and spec["required"]:
-            unresolved.append(logical)
-
-    if unresolved:
-        st.warning(
-            "Some required columns could not be auto-detected. "
-            "Please map them manually below."
+    for logical, label in REQUIRED_FIELDS.items():
+        guessed = smart_guess_column(columns, CANDIDATES[logical])
+        default_index = columns.index(guessed) if guessed in columns else 0
+        mapping[logical] = st.selectbox(
+            f"Required · {label}",
+            options=columns,
+            index=default_index,
+            key=f"{state_key}_required_{logical}",
         )
 
-    with st.expander("Column mapping", expanded=bool(unresolved)):
-        options = [NOT_MAPPED] + list(df.columns.astype(str))
-        for logical, spec in LOGICAL_FIELDS.items():
-            current = mapping[logical]
-            index = options.index(current) if current in options else 0
-            chosen = st.selectbox(
-                f"{spec['label']}" + (" *" if spec["required"] else ""),
-                options,
-                index=index,
-                key=f"map_{logical}",
-            )
-            mapping[logical] = None if chosen == NOT_MAPPED else chosen
+    for logical, label in OPTIONAL_FIELDS.items():
+        guessed = smart_guess_column(columns, CANDIDATES[logical])
+        options = [NOT_PROVIDED] + columns
+        default_value = guessed if guessed in columns else NOT_PROVIDED
+        selected = st.selectbox(
+            f"Optional · {label}",
+            options=options,
+            index=options.index(default_value),
+            key=f"{state_key}_optional_{logical}",
+        )
+        mapping[logical] = None if selected == NOT_PROVIDED else selected
 
     return mapping
 
 
-def clean_data(df_raw: pd.DataFrame, mapping: Dict[str, Optional[str]]) -> pd.DataFrame:
-    """Strip whitespace, coerce numerics, normalize key fields into logical columns."""
-    df = _strip_dataframe_strings(df_raw)
-
-    # Rename mapped physical columns to stable logical names.
-    # Headers were whitespace-stripped above, so strip the mapped keys too.
-    rename = {str(phys).strip(): logical for logical, phys in mapping.items() if phys}
-    df = df.rename(columns=rename)
-
-    for col in ["calculated_area", "room_area", "percentage", "occupancy"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "room_code" in df.columns:
-        df["room_code"] = df["room_code"].astype("string").str.strip()
-
-    # Drop rows with no usable area — they cannot participate in the strategy.
-    if "calculated_area" in df.columns:
-        df = df[df["calculated_area"].notna()]
-
-    return df.reset_index(drop=True)
-
-
-def compute_area_mismatch(df: pd.DataFrame) -> pd.Series:
-    """|Calculated Area − Room Area × Percentage| (data-integrity audit)."""
-    if not {"room_area", "percentage"}.issubset(df.columns):
-        return pd.Series(0.0, index=df.index)
-
-    pct = df["percentage"]
-    normalized_pct = np.where(pct.abs() > 1, pct / 100.0, pct)
-    expected = df["room_area"] * normalized_pct
-    return (df["calculated_area"] - expected).abs().fillna(0.0)
-
-
-# ---------------------------------------------------------------------------
-# 2. Task Engine (WMS "Slotting Optimization" logic)
-# ---------------------------------------------------------------------------
-
-def calculate_task_priority(row: pd.Series) -> str:
-    """Three-dimension priority score: integrity, opportunity, occupancy state."""
-    score = 0
-    # Dimension 1: data integrity (must-fix) — highest weight
-    if row["area_mismatch"] > 50:
-        score += 50
-    # Dimension 2: subdivision/reallocation gain (quick win)
-    if row["potential_gain"] > 100:
-        score += 30
-    # Dimension 3: utilization state
-    if row.get("is_unoccupied", False):
-        score += 20
-
-    if score >= 80:
-        return "🔥 Urgent (Immediate Audit)"
-    if score >= 50:
-        return "⚡ High (Subdivision Candidate)"
-    return "📅 Planning (Future Restack)"
-
-
-def generate_tasks(
-    df: pd.DataFrame,
-    area_threshold: float,
-    target_density: float,
-) -> pd.DataFrame:
-    """Apply strategy rules row-by-row and emit an actionable task list."""
-    work = df.copy()
-    work["area_mismatch"] = compute_area_mismatch(work)
-
-    has_occupancy = "occupancy" in work.columns
-    work["is_unoccupied"] = work["occupancy"].fillna(0).eq(0) if has_occupancy else False
-
-    room_type = (
-        work["room_type"].astype("string").str.lower()
-        if "room_type" in work.columns
-        else pd.Series("", index=work.index, dtype="string")
-    )
-    area = work["calculated_area"]
-
-    # Rule 1 — SUBDIVIDE: large offices above the threshold.
-    is_office = room_type.str.contains("office", na=False)
-    subdivide_mask = is_office & (area > area_threshold)
-
-    # Rule 2 — REALLOCATE: unoccupied rooms, or tiny dead spaces (< 50 sqft).
-    reallocate_mask = (work["is_unoccupied"] & has_occupancy) | (area < 50)
-    reallocate_mask &= ~subdivide_mask  # one action per room
-
-    # Rule 3 — AUDIT: significant data mismatch (> 50 sqft) blocks planning.
-    audit_mask = (work["area_mismatch"] > 50) & ~subdivide_mask & ~reallocate_mask
-
-    tasks: List[pd.DataFrame] = []
-
-    def _mk(mask: pd.Series, action: str, gain: pd.Series) -> None:
-        if not mask.any():
-            return
-        sub = work.loc[mask].copy()
-        sub["action"] = action
-        sub["potential_gain"] = gain.loc[mask].clip(lower=0).round(0)
-        tasks.append(sub)
-
-    occupants = (
-        work["occupancy"].clip(lower=1) if has_occupancy
-        else pd.Series(1.0, index=work.index)
-    )
-    _mk(subdivide_mask, "SUBDIVIDE", area - target_density * occupants)
-    _mk(reallocate_mask, "REALLOCATE", area)
-    _mk(audit_mask, "AUDIT DATA", pd.Series(0.0, index=work.index))
-
-    if not tasks:
-        return pd.DataFrame(
-            columns=["room_code", "action", "potential_gain", "priority", "notes"]
-        )
-
-    result = pd.concat(tasks, ignore_index=True)
-    result["priority"] = result.apply(calculate_task_priority, axis=1)
-    result["priority_rank"] = result["priority"].map(
-        {"🔥 Urgent (Immediate Audit)": 0,
-         "⚡ High (Subdivision Candidate)": 1,
-         "📅 Planning (Future Restack)": 2}
-    )
-    result = result.sort_values(
-        ["priority_rank", "potential_gain"], ascending=[True, False]
-    ).reset_index(drop=True)
-    result["notes"] = ""
-
-    display_cols = [
-        c for c in [
-            "room_code", "building", "department", "room_type",
-            "calculated_area", "action", "potential_gain",
-            "area_mismatch", "priority", "notes",
-        ] if c in result.columns
+def project_config(mapping: Dict[str, Optional[str]]) -> Dict[str, object]:
+    columns = {key: value for key, value in mapping.items() if value}
+    numeric_cols = [
+        logical
+        for logical in ["calculated_area", "room_area", "percentage", "occupancy"]
+        if logical in columns
     ]
-    return result[display_cols]
+    return {
+        "columns": columns,
+        "numeric_cols": numeric_cols,
+        "room_code_col": "room_code",
+        "ficm_code_col": "ficm_code",
+        "truth_area_col": "calculated_area",
+        "id_components": [
+            logical for logical in ["building", "floor_code"] if logical in columns
+        ],
+    }
 
 
-# ---------------------------------------------------------------------------
-# 3. Export
-# ---------------------------------------------------------------------------
-
-def build_excel_report(tasks: pd.DataFrame, inventory: pd.DataFrame) -> bytes:
-    """Package tasks (with user notes) + cleaned inventory into one Excel file."""
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        tasks.to_excel(writer, sheet_name="Strategy Task List", index=False)
-        inventory.to_excel(writer, sheet_name="Cleaned Inventory", index=False)
-    return buffer.getvalue()
+def mapping_fingerprint(mapping: Dict[str, Optional[str]]) -> str:
+    payload = json.dumps(mapping, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# 4. Dashboard UI
-# ---------------------------------------------------------------------------
+def benchmark_fingerprint(benchmark: pd.DataFrame) -> str:
+    stable = benchmark[["ficm_code", "benchmark_area"]].copy()
+    stable = stable.sort_values("ficm_code").reset_index(drop=True)
+    payload = stable.to_json(orient="records", force_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def build_excel_report(
+    tasks: pd.DataFrame, inventory: pd.DataFrame, benchmark: pd.DataFrame
+) -> bytes:
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        tasks.to_excel(writer, sheet_name="Strategy Tasks", index=False)
+        inventory.to_excel(writer, sheet_name="Canonical Inventory", index=False)
+        benchmark.to_excel(writer, sheet_name="Benchmark Inputs", index=False)
+    return output.getvalue()
+
+
+def render_filters(frame: pd.DataFrame) -> pd.DataFrame:
+    filtered = frame.copy()
+    with st.sidebar:
+        st.header("Result Filters")
+        for column, label in [("building", "Building"), ("department", "Department")]:
+            if column not in filtered.columns:
+                continue
+            options = sorted(
+                value
+                for value in filtered[column].dropna().astype(str).unique().tolist()
+                if value != "<NA>"
+            )
+            mode = st.selectbox(
+                f"{label} filter",
+                ["All", "Select"],
+                key=f"filter_mode_{column}",
+            )
+            if mode == "Select":
+                selected = st.multiselect(
+                    label, options, default=options, key=f"filter_values_{column}"
+                )
+                filtered = filtered[filtered[column].astype(str).isin(selected)]
+    return filtered
+
 
 def main() -> None:
-    st.set_page_config(
-        page_title="Space Strategy Workbench",
-        page_icon="🏗️",
-        layout="wide",
-    )
-    st.title("🏗️ Space Strategy Workbench")
+    st.title("Space Strategy Workbench")
     st.caption(
-        "Space-as-Inventory: upload a space list, tune the strategy knobs, "
-        "and get an actionable task list — WMS logic for master planning."
+        "Upload → confirm mapping → review benchmarks → run Integrity & Opportunity."
+    )
+    st.info(
+        "Preview mode: benchmark values are editable demo defaults. Uploaded data is "
+        "processed in the current app session and is not written to this repository."
     )
 
-    # --- Sidebar: ingest + strategy sandbox -------------------------------
-    with st.sidebar:
-        st.header("1️⃣ Data Ingestor")
-        uploaded = st.file_uploader("Upload space list (Excel)", type=["xlsx", "xls"])
-
-        sheet_name = st.text_input("Sheet name", value="Rooms Pct")
-        header_row = st.number_input(
-            "Header row (0-indexed)", min_value=0, max_value=20, value=2,
-            help="UPitt space lists start headers on row 3 → enter 2.",
+    upload_column, demo_column = st.columns([3, 1])
+    with upload_column:
+        uploaded_file = st.file_uploader(
+            "Upload an Excel room inventory", type=["xlsx", "xls"]
         )
+    with demo_column:
+        st.write("")
+        st.write("")
+        if st.button("Use demo inventory", use_container_width=True):
+            st.session_state["use_demo_inventory"] = True
 
-        st.header("2️⃣ Strategy Sandbox")
-        area_threshold = st.slider(
-            "Area Threshold (sqft)", 150, 500, 250, step=10,
-            help="Offices larger than this are subdivision candidates.",
-        )
-        target_density = st.slider(
-            "Target Density (sqft / person)", 80, 200, 120, step=5,
-            help="Ideal allocation per occupant.",
-        )
-
-    if uploaded is None:
-        st.info("⬅️ Upload an Excel space list to begin. No data ever leaves your browser session.")
+    if uploaded_file is not None:
+        file_bytes = uploaded_file.getvalue()
+        file_key = hashlib.sha256(file_bytes).hexdigest()[:16]
+        try:
+            raw_excel, auto_header_index = read_uploaded_excel(uploaded_file)
+        except Exception as exc:
+            st.error(f"Unable to read this workbook: {exc}")
+            st.stop()
+    elif st.session_state.get("use_demo_inventory"):
+        raw_excel = build_demo_raw_excel()
+        auto_header_index = _first_non_empty_row(raw_excel)
+        file_key = "bundled-demo-v1"
+        st.caption("Using a bundled synthetic inventory for interface preview.")
+    else:
+        st.caption("No workbook ready? Use the synthetic demo to preview the full flow.")
         st.stop()
 
-    # --- Load + clean ------------------------------------------------------
-    try:
-        df_raw = load_uploaded_file(uploaded.getvalue(), sheet_name, int(header_row))
-    except ValueError as exc:
-        st.error(
-            f"Could not read sheet '{sheet_name}': {exc}\n\n"
-            "Check the sheet name and header row in the sidebar."
-        )
-        st.stop()
-
-    mapping = resolve_columns(df_raw)
-    missing_required = [
-        spec["label"]
-        for k, spec in LOGICAL_FIELDS.items()
-        if spec["required"] and mapping.get(k) is None
-    ]
-    if missing_required:
-        st.error("Required columns not mapped: " + ", ".join(missing_required))
-        st.stop()
-
-    df = clean_data(df_raw, mapping)
-
-    # --- Sidebar filters (need data to populate options) -------------------
-    with st.sidebar:
-        st.header("3️⃣ Priority Filters")
-        if "building" in df.columns:
-            buildings = sorted(df["building"].dropna().astype(str).unique())
-            picked_b = st.multiselect("Buildings", buildings, default=[])
-            if picked_b:
-                df = df[df["building"].astype(str).isin(picked_b)]
-        if "department" in df.columns:
-            depts = sorted(df["department"].dropna().astype(str).unique())
-            picked_d = st.multiselect("Departments", depts, default=[])
-            if picked_d:
-                df = df[df["department"].astype(str).isin(picked_d)]
-
-    # --- Task engine (reactive: reruns on every slider move) ---------------
-    tasks = generate_tasks(df, area_threshold, target_density)
-
-    # --- Top metrics --------------------------------------------------------
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Total Potential Area Gains", f"{tasks['potential_gain'].sum():,.0f} sqft"
-              if not tasks.empty else "0 sqft")
-    m2.metric("Tasks Identified", f"{len(tasks):,}")
-    m3.metric("Rooms in Scope", f"{len(df):,}")
-
-    # --- Split view ---------------------------------------------------------
-    left, right = st.columns([1, 1])
-
-    with left:
-        st.subheader("📦 Inventory View")
-        st.caption("Cleaned, filtered room list — searchable and sortable.")
-        st.dataframe(df, use_container_width=True, height=430)
-
-        if "department" in tasks.columns and not tasks.empty:
-            st.subheader("📊 Potential Gains by Department")
-            gains = (
-                tasks.groupby("department")["potential_gain"]
-                .sum()
-                .sort_values(ascending=False)
-                .head(15)
+    with st.expander("Step 1 · Confirm header", expanded=True):
+        st.caption(f"Suggested header: Excel row {auto_header_index + 1}")
+        manual = st.toggle("Choose a different header row", value=False)
+        header_row = auto_header_index + 1
+        if manual:
+            header_row = int(
+                st.number_input(
+                    "Header row in Excel (1-based)",
+                    min_value=1,
+                    max_value=max(len(raw_excel), 1),
+                    value=min(auto_header_index + 1, max(len(raw_excel), 1)),
+                )
             )
-            st.bar_chart(gains)
+        header_index = int(header_row - 1)
+        parsed = parse_excel_with_header_row(raw_excel, header_index)
+        st.write("Detected columns", list(parsed.columns))
+        st.dataframe(parsed.head(5), use_container_width=True, hide_index=True)
+
+        header_key = f"{file_key}:{header_index}"
+        if st.button("Confirm header", type="primary"):
+            st.session_state["confirmed_header"] = header_key
+            st.session_state.pop("confirmed_mapping", None)
+            st.session_state.pop("run_result", None)
+
+    if st.session_state.get("confirmed_header") != header_key:
+        st.warning("Confirm the header to continue.")
+        st.stop()
+
+    if parsed.empty or len(parsed.columns) == 0:
+        st.error("No data columns were found below this header.")
+        st.stop()
+
+    with st.expander("Step 2 · Confirm column mapping", expanded=True):
+        mapping = render_mapping_ui(parsed, header_key)
+        current_mapping_key = f"{header_key}:{mapping_fingerprint(mapping)}"
+        if st.button("Confirm mapping", type="primary"):
+            st.session_state["confirmed_mapping"] = current_mapping_key
+            st.session_state.pop("run_result", None)
+
+    if st.session_state.get("confirmed_mapping") != current_mapping_key:
+        st.warning("Confirm the required column mapping to continue.")
+        st.stop()
+
+    inventory = build_canonical_inventory(parsed, project_config(mapping))
+    if inventory.empty:
+        st.error("No rows with a usable Calculated Area were found.")
+        st.stop()
+
+    default_benchmark = build_benchmark_table(inventory)
+    with st.expander("Step 3 · Review benchmark inputs", expanded=True):
+        st.caption(
+            "Benchmarks are keyed by FICM code. Room Type is display-only. Edit any "
+            "value to create a session override; the engine logic does not change."
+        )
+        edited_benchmark = st.data_editor(
+            default_benchmark,
+            use_container_width=True,
+            hide_index=True,
+            disabled=["ficm_code", "ficm_family", "room_type", "source"],
+            column_config={
+                "benchmark_area": st.column_config.NumberColumn(
+                    "Benchmark Area (sqft)", min_value=0.0, format="%.1f"
+                )
+            },
+            key=f"benchmark_editor_{current_mapping_key}",
+        )
+        benchmark = mark_benchmark_sources(edited_benchmark, default_benchmark)
+        st.dataframe(benchmark, use_container_width=True, hide_index=True)
+
+    with st.expander("Future inputs · interfaces reserved", expanded=False):
+        st.write("Alignment: no input connected")
+        st.write("Relocation difficulty: no input connected")
+        st.caption("These optional inputs can be connected later without changing this flow.")
+
+    run_key = (
+        f"{current_mapping_key}:{benchmark_fingerprint(benchmark)}"
+    )
+    with st.expander("Step 4 · Run rating", expanded=True):
+        if st.button("Run Integrity & Opportunity", type="primary"):
+            st.session_state["run_result"] = generate_tasks(inventory, benchmark)
+            st.session_state["run_fingerprint"] = run_key
+
+    if st.session_state.get("run_fingerprint") != run_key:
+        st.info("Run the rating engine. If an input changes, run it again.")
+        st.stop()
+
+    tasks = st.session_state.get("run_result", pd.DataFrame()).copy()
+    filtered_inventory = render_filters(inventory)
+    filtered_tasks = tasks.copy()
+    if "__source_row" in filtered_inventory.columns and "__source_row" in tasks.columns:
+        allowed_rows = set(filtered_inventory["__source_row"].tolist())
+        filtered_tasks = tasks[tasks["__source_row"].isin(allowed_rows)].copy()
+
+    metrics = st.columns(3)
+    metrics[0].metric("Rooms in scope", f"{len(filtered_inventory):,}")
+    metrics[1].metric("Tasks", f"{len(filtered_tasks):,}")
+    potential = (
+        filtered_tasks.get("potential_area_released", pd.Series(dtype=float))
+        .clip(lower=0)
+        .sum()
+    )
+    metrics[2].metric("Potential area", f"{potential:,.0f} sqft")
+
+    left, right = st.columns([1.15, 1])
+    with left:
+        st.subheader("Canonical inventory")
+        search = st.text_input("Search room, floor, department, or building")
+        display_inventory = filtered_inventory.copy()
+        if search:
+            query = search.strip().lower()
+            searchable = [
+                column
+                for column in ["room_code", "floor_code", "department", "building"]
+                if column in display_inventory.columns
+            ]
+            mask = pd.Series(False, index=display_inventory.index)
+            for column in searchable:
+                mask |= display_inventory[column].astype(str).str.lower().str.contains(
+                    query, na=False
+                )
+            display_inventory = display_inventory[mask]
+        st.dataframe(display_inventory, use_container_width=True, hide_index=True)
 
     with right:
-        st.subheader("🚚 Actionable Tasks")
-        st.caption(
-            "Sorted by priority. Add Architectural Notes directly in the "
-            "table — they are included in the export."
-        )
-        if tasks.empty:
-            st.success("No optimization tasks under the current strategy. Try lowering the Area Threshold.")
+        st.subheader("Actionable tasks")
+        if filtered_tasks.empty:
+            st.success("No Integrity or Opportunity tasks under the current inputs.")
         else:
-            edited_tasks = st.data_editor(
-                tasks,
-                use_container_width=True,
-                height=430,
-                disabled=[c for c in tasks.columns if c != "notes"],
-                column_config={
-                    "notes": st.column_config.TextColumn(
-                        "Architectural Notes", width="large"
-                    ),
-                    "potential_gain": st.column_config.NumberColumn(
-                        "Potential Gain (sqft)", format="%.0f"
-                    ),
-                    "calculated_area": st.column_config.NumberColumn(
-                        "Area (sqft)", format="%.0f"
-                    ),
-                    "area_mismatch": st.column_config.NumberColumn(
-                        "Mismatch (sqft)", format="%.1f"
-                    ),
-                },
-                key="task_editor",
+            notes = st.session_state.setdefault("task_notes", {})
+            page_count = max(int(np.ceil(len(filtered_tasks) / TASK_PAGE_SIZE)), 1)
+            page = int(
+                st.number_input(
+                    "Task page", min_value=1, max_value=page_count, value=1, step=1
+                )
+            )
+            start = (page - 1) * TASK_PAGE_SIZE
+            page_tasks = filtered_tasks.iloc[start : start + TASK_PAGE_SIZE]
+            st.caption(
+                f"Showing {start + 1}-{start + len(page_tasks)} of {len(filtered_tasks)}"
             )
 
+            for _, row in page_tasks.iterrows():
+                task_id = str(row["__task_id"])
+                with st.container(border=True):
+                    st.markdown(
+                        f"**{row['action']} · Room {row.get('room_code', '')}**  \n"
+                        f"Integrity: **{row['integrity_score']}** · "
+                        f"Opportunity: **{row['opportunity_score']}** · "
+                        f"Potential: **{row['potential_area_released']:.1f} sqft**"
+                    )
+                    st.caption(
+                        f"FICM: {row.get('ficm_code', 'Unavailable')} · "
+                        f"Integrity evidence: {row.get('integrity_source', 'Unavailable')} · "
+                        f"Benchmark: {row.get('benchmark_source', 'Unavailable')}"
+                    )
+                    notes[task_id] = st.text_input(
+                        "Architectural notes",
+                        value=notes.get(task_id, ""),
+                        key=f"note_{task_id}",
+                    )
+
+            export_tasks = filtered_tasks.copy()
+            export_tasks["architectural_notes"] = [
+                notes.get(str(task_id), "") for task_id in export_tasks["__task_id"]
+            ]
             st.download_button(
-                "⬇️ Download Final Strategy Task List (Excel)",
-                data=build_excel_report(edited_tasks, df),
+                "Download task workbook",
+                data=build_excel_report(export_tasks, filtered_inventory, benchmark),
                 file_name="Space_Strategy_Task_List.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                type="primary",
+                use_container_width=True,
             )
+
+    st.subheader("Potential area by department")
+    if "department" in filtered_tasks.columns and not filtered_tasks.empty:
+        chart = (
+            filtered_tasks.groupby("department", dropna=False)["potential_area_released"]
+            .sum()
+            .clip(lower=0)
+            .sort_values(ascending=False)
+            .rename_axis("department")
+            .reset_index()
+        )
+        st.bar_chart(chart, x="department", y="potential_area_released")
+    else:
+        st.caption("Department data is not available for this chart.")
 
 
 if __name__ == "__main__":
     main()
+
