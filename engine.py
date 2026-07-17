@@ -1,6 +1,10 @@
+Exit code: 0
+Wall time: 0.9 seconds
+Output:
 from __future__ import annotations
 
 import hashlib
+import re
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
@@ -26,7 +30,7 @@ def suggested_benchmark(room_type: object) -> float:
     """Return a clearly labeled demo benchmark for UI preview."""
     normalized = str(room_type).strip().lower()
     for keyword, value in DEMO_BENCHMARKS.items():
-        if keyword in normalized:
+        if re.search(rf"\b{re.escape(keyword)}\b", normalized):
             return value
     return 240.0
 
