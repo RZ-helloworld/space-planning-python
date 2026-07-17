@@ -1,57 +1,87 @@
-Exit code: 0
-Wall time: 0.9 seconds
-Output:
 from __future__ import annotations
 
 import hashlib
-import re
 from typing import Callable, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
 
-from space_programming_pipeline import audit_canonical_inventory
+from space_programming_pipeline import audit_canonical_inventory, normalize_ficm_code
 
 ScoreHook = Callable[[pd.Series], object]
 
-DEMO_BENCHMARKS: Dict[str, float] = {
-    "office": 240.0,
-    "lab": 300.0,
-    "conference": 180.0,
-    "classroom": 350.0,
-    "support": 120.0,
+FICM_PREFIX_BENCHMARKS: Dict[str, Dict[str, object]] = {
+    "2": {"ficm_family": "Laboratory", "benchmark_area": 300.0},
+    "3": {"ficm_family": "Office / Conference", "benchmark_area": 240.0},
+    "6": {"ficm_family": "General Use", "benchmark_area": 240.0},
 }
+DEFAULT_BENCHMARK_AREA = 240.0
 
 INTEGRITY_GAP_THRESHOLD = 25.0
 OPPORTUNITY_HIGH_THRESHOLD = 50.0
 
 
-def suggested_benchmark(room_type: object) -> float:
-    """Return a clearly labeled demo benchmark for UI preview."""
-    normalized = str(room_type).strip().lower()
-    for keyword, value in DEMO_BENCHMARKS.items():
-        if re.search(rf"\b{re.escape(keyword)}\b", normalized):
-            return value
-    return 240.0
+def _ficm_family(ficm_code: object) -> str:
+    normalized = normalize_ficm_code(ficm_code)
+    prefix = normalized[:1] if normalized else ""
+    configured = FICM_PREFIX_BENCHMARKS.get(prefix)
+    return str(configured["ficm_family"]) if configured else "Unmapped FICM"
+
+
+def suggested_benchmark(ficm_code: object) -> float:
+    """Return a demo benchmark using only the normalized FICM code prefix."""
+    normalized = normalize_ficm_code(ficm_code)
+    prefix = normalized[:1] if normalized else ""
+    configured = FICM_PREFIX_BENCHMARKS.get(prefix)
+    if configured:
+        return float(configured["benchmark_area"])
+    return DEFAULT_BENCHMARK_AREA
 
 
 def build_benchmark_table(inventory: pd.DataFrame) -> pd.DataFrame:
-    room_types = sorted(
-        value
-        for value in inventory.get("room_type", pd.Series(dtype="string"))
-        .dropna()
-        .astype(str)
-        .unique()
-        .tolist()
-        if value and value != "<NA>"
+    display = pd.DataFrame(index=inventory.index)
+    display["ficm_code"] = inventory.get(
+        "ficm_code", pd.Series(pd.NA, index=inventory.index, dtype="string")
+    ).map(normalize_ficm_code)
+    display["room_type"] = inventory.get(
+        "room_type", pd.Series(pd.NA, index=inventory.index, dtype="string")
+    ).astype("string").str.strip()
+    display = display[display["ficm_code"] != ""].copy()
+
+    if display.empty:
+        return pd.DataFrame(
+            columns=[
+                "ficm_code",
+                "ficm_family",
+                "room_type",
+                "benchmark_area",
+                "source",
+            ]
+        )
+
+    descriptions = (
+        display.groupby("ficm_code", sort=True)["room_type"]
+        .agg(
+            lambda values: " / ".join(
+                sorted(
+                    {
+                        str(value)
+                        for value in values.dropna()
+                        if str(value).strip() and str(value) != "<NA>"
+                    }
+                )
+            )
+        )
+        .reset_index()
     )
-    return pd.DataFrame(
-        {
-            "room_type": room_types,
-            "benchmark_area": [suggested_benchmark(value) for value in room_types],
-            "source": ["Demo Default"] * len(room_types),
-        }
+    descriptions["ficm_family"] = descriptions["ficm_code"].map(_ficm_family)
+    descriptions["benchmark_area"] = descriptions["ficm_code"].map(
+        suggested_benchmark
     )
+    descriptions["source"] = "Demo Default"
+    return descriptions[
+        ["ficm_code", "ficm_family", "room_type", "benchmark_area", "source"]
+    ]
 
 
 def mark_benchmark_sources(
@@ -63,14 +93,14 @@ def mark_benchmark_sources(
         result.get("benchmark_area"), errors="coerce"
     )
     default_map = {
-        str(row.room_type): float(row.benchmark_area)
+        normalize_ficm_code(row.ficm_code): float(row.benchmark_area)
         for row in defaults.itertuples(index=False)
     }
     result["source"] = [
         "Session Override"
-        if pd.notna(area) and default_map.get(str(room_type)) != float(area)
+        if pd.notna(area) and default_map.get(normalize_ficm_code(ficm_code)) != float(area)
         else "Demo Default"
-        for room_type, area in zip(result["room_type"], result["benchmark_area"])
+        for ficm_code, area in zip(result["ficm_code"], result["benchmark_area"])
     ]
     return result
 
@@ -131,25 +161,31 @@ def generate_tasks(
     )
 
     benchmark_map = {
-        str(row.room_type).strip().lower(): float(row.benchmark_area)
+        normalize_ficm_code(row.ficm_code): float(row.benchmark_area)
         for row in benchmark_df.itertuples(index=False)
-        if pd.notna(row.room_type) and pd.notna(row.benchmark_area)
+        if normalize_ficm_code(row.ficm_code) and pd.notna(row.benchmark_area)
     }
     benchmark_source_map = {
-        str(row.room_type).strip().lower(): str(getattr(row, "source", "Provided"))
+        normalize_ficm_code(row.ficm_code): str(getattr(row, "source", "Provided"))
         for row in benchmark_df.itertuples(index=False)
-        if pd.notna(row.room_type)
+        if normalize_ficm_code(row.ficm_code)
     }
-    room_type_key = work["room_type"].astype("string").str.strip().str.lower()
-    work["benchmark_reference"] = room_type_key.map(benchmark_map)
-    work["benchmark_source"] = room_type_key.map(benchmark_source_map)
+    ficm_key = work.get(
+        "ficm_code", pd.Series(pd.NA, index=work.index, dtype="string")
+    ).map(normalize_ficm_code)
+    work["benchmark_reference"] = ficm_key.map(benchmark_map)
+    work["benchmark_source"] = ficm_key.map(benchmark_source_map)
     work["potential_area_released"] = (
         work["calculated_area"] - work["benchmark_reference"]
     )
-    work["opportunity_score"] = np.where(
-        work["potential_area_released"].ge(float(opportunity_threshold)).fillna(False),
-        "High",
-        "Low",
+    has_benchmark_input = work["benchmark_reference"].notna()
+    is_high_opportunity = work["potential_area_released"].ge(
+        float(opportunity_threshold)
+    ).fillna(False)
+    work["opportunity_score"] = np.select(
+        [has_benchmark_input & is_high_opportunity, has_benchmark_input],
+        ["High", "Low"],
+        default="Unknown",
     )
 
     work["strategic_alignment_score"] = _apply_hook(work, alignment)
@@ -183,6 +219,7 @@ def generate_tasks(
         "__source_row",
         "room_code",
         "floor_code",
+        "ficm_code",
         "room_type",
         "department",
         "building",
