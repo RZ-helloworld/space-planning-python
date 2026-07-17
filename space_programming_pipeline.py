@@ -50,7 +50,10 @@ def _build_dtype_map(config: ProjectConfig) -> Mapping[str, str]:
     room_code_col = _get_column_name(
         config, config.get("room_code_col", "room_code")
     )
-    return {room_code_col: "string"}
+    ficm_code_col = _get_column_name(
+        config, config.get("ficm_code_col", "ficm_code")
+    )
+    return {room_code_col: "string", ficm_code_col: "string"}
 
 
 def _normalize_room_code(value: Any) -> Any:
@@ -58,6 +61,18 @@ def _normalize_room_code(value: Any) -> Any:
         return pd.NA
     cleaned = str(value).strip()
     return cleaned if cleaned else pd.NA
+
+
+def normalize_ficm_code(value: Any) -> str:
+    """Normalize FICM identifiers without using room-type description text."""
+    if pd.isna(value):
+        return ""
+    cleaned = str(value).strip()
+    if not cleaned:
+        return ""
+    if cleaned.endswith(".0") and cleaned[:-2].isdigit():
+        cleaned = cleaned[:-2]
+    return cleaned.upper()
 
 
 def _resolve_file_path(source: ProjectConfig) -> str:
@@ -176,6 +191,12 @@ def clean_dataframe(df: pd.DataFrame, config: ProjectConfig) -> pd.DataFrame:
     else:
         logger.warning("Missing room code column '%s'.", room_code_col)
 
+    ficm_code_col = _get_column_name(
+        config, config.get("ficm_code_col", "ficm_code")
+    )
+    if ficm_code_col in cleaned.columns:
+        cleaned[ficm_code_col] = cleaned[ficm_code_col].map(normalize_ficm_code)
+
     numeric_cols = _resolve_configured_column_names(
         config, config.get("numeric_cols", [])
     )
@@ -211,7 +232,14 @@ def build_canonical_inventory(
             canonical[provenance_col] = cleaned[provenance_col]
     canonical["__source_row"] = cleaned.index.astype(int)
 
-    for col in ["room_code", "floor_code", "room_type", "department", "building"]:
+    for col in [
+        "room_code",
+        "floor_code",
+        "ficm_code",
+        "room_type",
+        "department",
+        "building",
+    ]:
         if col in canonical.columns:
             canonical[col] = canonical[col].astype("string").str.strip()
 
