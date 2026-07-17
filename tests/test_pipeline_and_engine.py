@@ -10,6 +10,26 @@ from space_programming_pipeline import (
 
 
 class PipelineAndEngineTests(unittest.TestCase):
+    def test_collaboration_space_uses_ficm_code_not_name(self) -> None:
+        inventory = pd.DataFrame(
+            {
+                "__source_row": [0],
+                "room_code": ["C-1"],
+                "ficm_code": ["350"],
+                "room_type": ["Collaboration Space"],
+                "calculated_area": [290.0],
+                "room_area": [290.0],
+            }
+        )
+        benchmark = build_benchmark_table(inventory)
+        self.assertEqual(benchmark.loc[0, "ficm_code"], "350")
+        self.assertEqual(benchmark.loc[0, "ficm_family"], "Office / Conference")
+        self.assertEqual(benchmark.loc[0, "benchmark_area"], 240.0)
+
+        tasks = generate_tasks(inventory, benchmark)
+        self.assertEqual(tasks.loc[0, "action"], "CAPTURE OPPORTUNITY")
+        self.assertEqual(tasks.loc[0, "benchmark_reference"], 240.0)
+
     def test_room_share_percentage_prevents_false_integrity_error(self) -> None:
         inventory = pd.DataFrame(
             {
@@ -29,6 +49,7 @@ class PipelineAndEngineTests(unittest.TestCase):
             {
                 "__source_row": [0],
                 "room_code": ["101"],
+                "ficm_code": ["310"],
                 "room_type": ["Office"],
                 "calculated_area": [300.0],
                 "room_area": [200.0],
@@ -37,6 +58,7 @@ class PipelineAndEngineTests(unittest.TestCase):
         )
         benchmark = pd.DataFrame(
             {
+                "ficm_code": ["310"],
                 "room_type": ["Office"],
                 "benchmark_area": [100.0],
                 "source": ["Session Override"],
@@ -52,6 +74,7 @@ class PipelineAndEngineTests(unittest.TestCase):
             {
                 "__source_row": [0],
                 "room_code": ["102"],
+                "ficm_code": ["310"],
                 "room_type": ["Office"],
                 "calculated_area": [220.0],
                 "room_area": [220.0],
@@ -71,6 +94,7 @@ class PipelineAndEngineTests(unittest.TestCase):
         raw = pd.DataFrame(
             {
                 " Room Number ": ["03"],
+                " Room Category ": [350.0],
                 " Space Type ": [" Office "],
                 " Allocated Area ": ["240"],
             }
@@ -78,14 +102,17 @@ class PipelineAndEngineTests(unittest.TestCase):
         config = {
             "columns": {
                 "room_code": "Room Number",
+                "ficm_code": "Room Category",
                 "room_type": "Space Type",
                 "calculated_area": "Allocated Area",
             },
             "room_code_col": "room_code",
+            "ficm_code_col": "ficm_code",
             "numeric_cols": ["calculated_area"],
         }
         canonical = build_canonical_inventory(raw, config)
         self.assertEqual(canonical.loc[0, "room_code"], "03")
+        self.assertEqual(canonical.loc[0, "ficm_code"], "350")
         self.assertEqual(canonical.loc[0, "room_type"], "Office")
         self.assertEqual(canonical.loc[0, "calculated_area"], 240.0)
 
@@ -94,6 +121,7 @@ class PipelineAndEngineTests(unittest.TestCase):
             {
                 "__source_row": [0],
                 "room_code": ["103"],
+                "ficm_code": ["250"],
                 "room_type": ["Lab"],
                 "calculated_area": [400.0],
                 "room_area": [400.0],
@@ -101,6 +129,7 @@ class PipelineAndEngineTests(unittest.TestCase):
         )
         benchmark = pd.DataFrame(
             {
+                "ficm_code": ["250"],
                 "room_type": ["Lab"],
                 "benchmark_area": [300.0],
                 "source": ["Demo Default"],
