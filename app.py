@@ -20,6 +20,7 @@ st.set_page_config(page_title="Space Strategy Workbench", page_icon="🏗️", l
 
 REQUIRED_FIELDS: Dict[str, str] = {
     "room_code": "Room Code",
+    "ficm_code": "FICM Code",
     "room_type": "Room Type",
     "calculated_area": "Calculated Area",
 }
@@ -35,6 +36,13 @@ OPTIONAL_FIELDS: Dict[str, str] = {
 
 CANDIDATES: Dict[str, List[str]] = {
     "room_code": ["Room Code", "Room Number", "Room", "RM"],
+    "ficm_code": [
+        "Room Category",
+        "FICM Code",
+        "FICM",
+        "Space Category",
+        "Category",
+    ],
     "room_type": ["Room Type", "Space Type", "Room Use", "Type"],
     "calculated_area": ["Calculated Area", "Area", "Net Area", "ASF"],
     "floor_code": ["Floor Code", "Floor", "Level"],
@@ -55,7 +63,8 @@ def build_demo_raw_excel() -> pd.DataFrame:
         {
             "Room Code": ["03", "102", "201", "S-1"],
             "Floor Code": ["01", "01", "02", "B1"],
-            "Room Type": ["Office", "Office", "Lab", "Support"],
+            "Room Category": ["310", "350", "250", "610"],
+            "Room Type": ["Office", "Collaboration Space", "Lab", "Support"],
             "Calculated Area": [60, 320, 400, 120],
             "Room Area": [100, 220, 400, 120],
             "Percentage": [60, 100, 100, 100],
@@ -154,6 +163,7 @@ def project_config(mapping: Dict[str, Optional[str]]) -> Dict[str, object]:
         "columns": columns,
         "numeric_cols": numeric_cols,
         "room_code_col": "room_code",
+        "ficm_code_col": "ficm_code",
         "truth_area_col": "calculated_area",
         "id_components": [
             logical for logical in ["building", "floor_code"] if logical in columns
@@ -167,8 +177,8 @@ def mapping_fingerprint(mapping: Dict[str, Optional[str]]) -> str:
 
 
 def benchmark_fingerprint(benchmark: pd.DataFrame) -> str:
-    stable = benchmark[["room_type", "benchmark_area"]].copy()
-    stable = stable.sort_values("room_type").reset_index(drop=True)
+    stable = benchmark[["ficm_code", "benchmark_area"]].copy()
+    stable = stable.sort_values("ficm_code").reset_index(drop=True)
     payload = stable.to_json(orient="records", force_ascii=False)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
@@ -298,14 +308,14 @@ def main() -> None:
     default_benchmark = build_benchmark_table(inventory)
     with st.expander("Step 3 · Review benchmark inputs", expanded=True):
         st.caption(
-            "These are preview defaults. Edit any value to create a session override; "
-            "the engine logic does not change."
+            "Benchmarks are keyed by FICM code. Room Type is display-only. Edit any "
+            "value to create a session override; the engine logic does not change."
         )
         edited_benchmark = st.data_editor(
             default_benchmark,
             use_container_width=True,
             hide_index=True,
-            disabled=["room_type", "source"],
+            disabled=["ficm_code", "ficm_family", "room_type", "source"],
             column_config={
                 "benchmark_area": st.column_config.NumberColumn(
                     "Benchmark Area (sqft)", min_value=0.0, format="%.1f"
@@ -398,6 +408,7 @@ def main() -> None:
                         f"Potential: **{row['potential_area_released']:.1f} sqft**"
                     )
                     st.caption(
+                        f"FICM: {row.get('ficm_code', 'Unavailable')} · "
                         f"Integrity evidence: {row.get('integrity_source', 'Unavailable')} · "
                         f"Benchmark: {row.get('benchmark_source', 'Unavailable')}"
                     )
