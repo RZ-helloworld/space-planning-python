@@ -10,7 +10,7 @@ Upload Excel
   → or load the bundled synthetic inventory for a no-data preview
   → confirm the header
   → map source columns to the Framework-Wall schema
-  → review/edit room-type benchmarks
+  → review/edit FICM-code benchmarks
   → run Integrity and Opportunity
   → review task evidence and export Excel
 ```
@@ -37,10 +37,12 @@ real workbook.
   `Room Area × Percentage of Space`. If percentage is unavailable, Room Area
   is treated as a 100% allocation. A critical Integrity task takes priority
   over an Opportunity task.
-- **Opportunity:** compares Calculated Area with an editable benchmark for the
-  mapped room type.
+- **Opportunity:** compares Calculated Area with an editable benchmark keyed by
+  canonical `ficm_code`. Room Type is display-only and never selects a benchmark.
+- **FICM defaults:** `2xx` uses the Laboratory default (300 sqft), `3xx` uses
+  Office / Conference (240 sqft), and `6xx` uses General Use (240 sqft).
 - **Benchmark override:** the shipped values are explicitly labeled
-  `Demo Default`. Editing a number in the app marks it as `Session Override`.
+  `Demo Default`. Editing a number for a FICM code marks it as `Session Override`.
 - **Future interfaces:** optional Alignment and Relocation Difficulty hooks
   exist in the engine but are not required to run the preview.
 
@@ -51,8 +53,8 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use synthetic data only. They cover room-share percentages,
-Integrity precedence, benchmark overrides, leading-zero room codes, and the
-future scoring hooks.
+Integrity precedence, FICM benchmark overrides, leading-zero room codes,
+name-independent FICM selection, and the future scoring hooks.
 
 ## Privacy note
 
